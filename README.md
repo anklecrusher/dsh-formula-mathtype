@@ -105,16 +105,18 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 
 ## B 模式：全局热键（v0.3.0）
 
-插件加载后会常驻一个热键小助手（`helper.py hotkey`），注册系统级热键（默认 `Alt+M`）。使用流程：
+插件加载后会常驻一个热键小助手（`helper.py hotkey`），注册系统级热键（默认 `Ctrl+Alt+F`）。使用流程：
 
 1. `Win+Shift+S` 截公式（图进剪贴板）；
-2. **保持在 Word 里**，直接按 `Alt+M`；
+2. **保持在 Word 里**，直接按 `Ctrl+Alt+F`；
 3. 右上角弹出小提示「正在识别公式…」，完成后变成「✓ 已插入 MathType 公式」并显示 LaTeX 预览，2.6 秒后自动消失；
 4. 失败时显示红色错误提示（8 秒），详情写入 `%LOCALAPPDATA%\dsh-formula-mathtype\hotkey.log`。
 
 实测：简单公式从按键到插入约 **1.2–2.5 秒**，6 行方程组约 10 秒（主要是标准模型识别时间）。提示窗口是无激活（`WS_EX_NOACTIVATE`）的原生 Win32 分层窗口，不会抢 Word 焦点；本机 Python 的 Tcl/Tk 数据不完整，所以没有用 Tkinter。
 
-热键用低级键盘钩子（`WH_KEYBOARD_LL`）实现：按下 `Alt+M` 时组合键会被吞掉，**不会触发 Word 自带的「邮件」选项卡**（Word 里 `Alt+M` 是菜单快捷键）。Alt 键可能让 Word 闪一下键位提示，插件会在 0.3 秒后自动发送 Esc 清除。
+热键用低级键盘钩子（`WH_KEYBOARD_LL`）实现：按下 `Ctrl+Alt+F` 时组合键会被吞掉，**不会触发 Word 自带的「插入脚注」**（Word 里 `Ctrl+Alt+F` 正是插入脚注快捷键，已实测确认）。因为组合键不含单独的 Alt，不会触发 Word 的键位提示。
+
+副作用：插件运行期间，Word 的 `Ctrl+Alt+F` 插入脚注快捷键会被本插件占用；需要插脚注时用「引用 → 插入脚注」功能区按钮。
 
 启用/关闭/查看状态：
 
@@ -125,7 +127,7 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 /formula hotkey restart    # 重启（改配置后可用）
 ```
 
-配置 `hotkey: ''` 可以完全不启动热键助手；热键被其它软件占用时换一个（如 `Alt+Shift+F`）。
+配置 `hotkey: ''` 可以完全不启动热键助手；热键被其它软件占用时换一个（如 `Ctrl+Alt+M`）。
 
 ## 配置项
 
@@ -135,7 +137,7 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 | `helperPath` | 同目录 `helper.py` | sidecar 路径 |
 | `tokenFile` | `%LOCALAPPDATA%\dsh-formula-mathtype\simpletex.token` | 一行一个 UAT |
 | `model` | `standard` | `standard`=标准模型（0.05 元/次，复杂公式明显更准），`turbo`=轻量模型（0.04 元/次，复杂方程组不稳） |
-| `hotkey` | `Alt+M` | B 模式全局热键；写成空字符串 `''` 关闭热键常驻 |
+| `hotkey` | `Ctrl+Alt+F` | B 模式全局热键；写成空字符串 `''` 关闭热键常驻 |
 
 ## 为什么走这条链路
 
@@ -166,7 +168,7 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 | `/formula hotkey` 显示未运行 | 看状态里的最近错误；常见是键盘钩子安装失败（安全软件/输入法抢占），换一个 `hotkey` 后重启 DSH |
 | 提示“另一个热键助手已在运行” | 上次 DSH 异常退出留下的进程：任务管理器结束对应 `python.exe`（命令行含 `helper.py hotkey`）后 `/formula hotkey restart` |
 | 按热键没反应 | 先在 Word 里确认光标位置；再 `/formula hotkey status` 看助手是否在运行；详细过程见 `hotkey.log` |
-| 按 `Alt+M` 后 Word 切换到「邮件」选项卡 | 说明键盘钩子没生效（助手未运行或被安全软件拦截），`/formula hotkey status` 查看 |
+| 按 `Ctrl+Alt+F` 后 Word 多出一个脚注 | 说明键盘钩子没生效（助手未运行或被安全软件拦截），`/formula hotkey status` 查看 |
 
 ## 限制
 

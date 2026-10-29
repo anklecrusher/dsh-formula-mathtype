@@ -545,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--model", default="standard", choices=["turbo", "standard"])
 
     hotkey_parser = sub.add_parser("hotkey", help="run the global-hotkey companion (B mode)")
-    hotkey_parser.add_argument("--hotkey", default="Alt+M")
+    hotkey_parser.add_argument("--hotkey", default="Ctrl+Alt+F")
     hotkey_parser.add_argument("--token-file", default="")
     hotkey_parser.add_argument("--model", default="standard", choices=["turbo", "standard"])
 

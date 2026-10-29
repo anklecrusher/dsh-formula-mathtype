@@ -3,7 +3,7 @@
 """Global-hotkey companion for @local/dsh-formula-mathtype (the "B" mode).
 
 The DSH plugin starts this as a small resident process. Pressing the configured
-hotkey (default Alt+M) anywhere on the desktop:
+hotkey (default Ctrl+Alt+F) anywhere on the desktop:
 
 1. reads the formula screenshot from the clipboard,
 2. runs the same SimpleTex OCR + normalization + MathType OLE injection as the
@@ -13,16 +13,17 @@ hotkey (default Alt+M) anywhere on the desktop:
    focus; no Tk/Tcl is involved (the local Python's Tcl package is incomplete).
 
 The combo is captured with a low-level keyboard hook (`WH_KEYBOARD_LL`) rather
-than `RegisterHotKey`, so the key never reaches Word. This matters for a combo
-like Alt+M: Word treats Alt+M as its Mailings-tab shortcut. The hook swallows
-the main key; Alt may still put Word into keytip mode briefly, which is cleared
-with an automatic Esc about 0.3 s later when Word owns the foreground window.
+than `RegisterHotKey`, so the key never reaches the focused application. That
+matters even for Ctrl+Alt+F: Word binds it to "insert footnote", so without the
+hook every insertion would also add a footnote. Because this combo has no Alt
+modifier, no Word keytip mode is triggered; the Esc-cleanup path only runs for
+Alt/Win-based hotkeys.
 
 Diagnostics are written to ``%LOCALAPPDATA%\\dsh-formula-mathtype\\hotkey.log``.
 
 Standalone use (for testing)::
 
-    python helper.py hotkey --hotkey Alt+M
+    python helper.py hotkey --hotkey Ctrl+Alt+F
 """
 
 from __future__ import annotations
@@ -284,7 +285,7 @@ def _foreground_process_name() -> str:
 
 
 def parse_hotkey(spec: str) -> tuple[int, int]:
-    """Turn "Alt+M" into (MOD_*, virtual-key code)."""
+    """Turn "Ctrl+Alt+F" into (MOD_*, virtual-key code)."""
     text = (spec or "").strip()
     if not text:
         raise ValueError("热键为空")
@@ -307,7 +308,7 @@ def parse_hotkey(spec: str) -> tuple[int, int]:
         else:
             raise ValueError("无法解析热键片段：%s" % part)
     if key is None:
-        raise ValueError("热键需要包含一个主键，例如 Alt+M")
+        raise ValueError("热键需要包含一个主键，例如 Ctrl+Alt+F")
     if modifiers == 0:
         raise ValueError("热键至少需要一个修饰键（Ctrl/Alt/Shift/Win）")
     return modifiers | MOD_NOREPEAT, key
@@ -511,7 +512,12 @@ class HotkeyApp:
             return self._fatal(str(exc))
         self.modifiers = modifiers & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN)
         self.vk = vk
-        self._needs_esc = bool(self.modifiers & (MOD_ALT | MOD_WIN))
+        has_alt = bool(self.modifiers & MOD_ALT)
+        has_ctrl = bool(self.modifiers & MOD_CONTROL)
+        has_win = bool(self.modifiers & MOD_WIN)
+        # Alt/Win alone or with Shift can put Word into keytip/Start mode; Ctrl+Alt
+        # (the default Ctrl+Alt+F) does not, so no Esc is sent for it.
+        self._needs_esc = (has_alt or has_win) and not (has_alt and has_ctrl)
         self._hook_proc_ref = HOOKPROC(self._hook_proc)
         self.hook = _user32.SetWindowsHookExW(
             WH_KEYBOARD_LL, self._hook_proc_ref, _kernel32.GetModuleHandleW(None), 0
@@ -519,7 +525,7 @@ class HotkeyApp:
         if not self.hook:
             return self._fatal(
                 "安装全局键盘钩子失败（热键 %s 无法注册）。"
-                "可在 cordis.patch.yml 的插件配置里换一个 hotkey，例如 Alt+Shift+F。" % self.hotkey
+                "可在 cordis.patch.yml 的插件配置里换一个 hotkey，例如 Ctrl+Alt+M。" % self.hotkey
             )
         _append_log("hotkey registered: %s (low-level hook)" % self.hotkey)
         if self.toast is not None:

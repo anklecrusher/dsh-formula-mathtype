@@ -31,7 +31,7 @@
  *   - the Python sidecar (`helper.py serve`), always on, driven over JSON lines;
  *   - the global-hotkey companion (`helper.py hotkey`), started after the
  *       sidecar warmed up. It registers a system-wide hotkey (default
- *       Alt+M), so pressing it while Word is focused inserts the clipboard
+ *       Ctrl+Alt+F), so pressing it while Word is focused inserts the clipboard
  *       screenshot without switching back to DSH. Set `hotkey: ''` in the plugin
  *       config to disable it.
  *
@@ -111,7 +111,7 @@ const REQUEST_TIMEOUT_MS = 180_000
 const WARMUP_TIMEOUT_MS = 60_000
 
 /** Default system-wide hotkey for the B-mode companion. */
-const DEFAULT_HOTKEY = 'Alt+M'
+const DEFAULT_HOTKEY = 'Ctrl+Alt+F'
 
 /**
  * Persistent JSON-lines client for helper.py.
@@ -429,7 +429,7 @@ async function handleHotkeyCommand(companion, sub) {
   }
   if (action === 'on' || action === 'start') {
     if (companion.options.hotkey && companion.options.hotkey.length === 0) {
-      return { kind: 'error', text: '未配置 hotkey：请在 cordis.patch.yml 的插件配置里填写 hotkey（如 Alt+M）。' }
+      return { kind: 'error', text: '未配置 hotkey：请在 cordis.patch.yml 的插件配置里填写 hotkey（如 Ctrl+Alt+F）。' }
     }
     companion.start()
     await new Promise((resolve) => setTimeout(resolve, 700))
