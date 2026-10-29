@@ -163,28 +163,66 @@ namespace MathTypeInjector
         private static void InjectAtRange(dynamic doc, dynamic range, string formula, string formatName)
         {
             object missing = Type.Missing;
-            dynamic shape = doc.InlineShapes.AddOLEObject(
-                "Equation.DSMT4", "", false, false, missing, missing, missing, range);
-            dynamic oleFormat = shape.OLEFormat;
-            oleFormat.DoVerb(2);
-            System.Threading.Thread.Sleep(120);
-            object raw = oleFormat.Object;
-            ComIDataObject dataObject = raw as ComIDataObject;
-            IOleObject oleObject = raw as IOleObject;
-            if (dataObject == null)
-                throw new InvalidOperationException("Equation.DSMT4 没有暴露 IDataObject，无法写入公式内容。");
-            SetUnicodeData(dataObject, formatName, formula);
-            if (oleObject != null)
+            dynamic shape = null;
+            StartMathTypeWindowHider(GetForegroundWindow());
+            try
             {
-                int hr = oleObject.Close(OLECLOSE_SAVEIFDIRTY);
-                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                shape = doc.InlineShapes.AddOLEObject(
+                    "Equation.DSMT4", "", false, false, missing, missing, missing, range);
+                HideMathTypeEditorWindows(); // synchronous catch-up before the hider thread ticks
+                dynamic oleFormat = shape.OLEFormat;
+                object raw = GetOleDataObject(oleFormat);
+                ComIDataObject dataObject = raw as ComIDataObject;
+                IOleObject oleObject = raw as IOleObject;
+                if (dataObject == null)
+                    throw new InvalidOperationException("Equation.DSMT4 没有暴露 IDataObject，无法写入公式内容。");
+                SetUnicodeData(dataObject, formatName, formula);
+                if (oleObject != null)
+                {
+                    int hr = oleObject.Close(OLECLOSE_SAVEIFDIRTY);
+                    if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                }
+                System.Threading.Thread.Sleep(80);
+                Console.WriteLine(
+                    "{\"ok\":true,\"target\":\"word\",\"width\":\"" +
+                    shape.Width.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    "\",\"height\":\"" +
+                    shape.Height.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"}");
             }
-            System.Threading.Thread.Sleep(80);
-            Console.WriteLine(
-                "{\"ok\":true,\"width\":\"" +
-                shape.Width.ToString(System.Globalization.CultureInfo.InvariantCulture) +
-                "\",\"height\":\"" +
-                shape.Height.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"}");
+            catch
+            {
+                try { if (shape != null) shape.Delete(); } catch { }
+                throw;
+            }
+            finally
+            {
+                StopMathTypeWindowHider();
+            }
+        }
+
+        /// <summary>
+        /// Fetch the embedded object's IDataObject without opening the OLE server UI.
+        /// MathType exposes Object immediately after AddOLEObject (verified for Word and
+        /// PowerPoint), so DoVerb(OPEN) is only used as a fallback: it opens a MathType
+        /// editor window and steals the foreground for a moment.
+        /// </summary>
+        private static object GetOleDataObject(dynamic oleFormat)
+        {
+            object raw = null;
+            for (int attempt = 0; attempt < 12; attempt++)
+            {
+                try { raw = oleFormat.Object; } catch (COMException) { raw = null; }
+                if (raw is ComIDataObject) return raw;
+                System.Threading.Thread.Sleep(40);
+            }
+            try { oleFormat.DoVerb(2); } catch (COMException) { }
+            for (int attempt = 0; attempt < 40; attempt++)
+            {
+                System.Threading.Thread.Sleep(50);
+                try { raw = oleFormat.Object; } catch (COMException) { raw = null; }
+                if (raw is ComIDataObject) return raw;
+            }
+            return raw;
         }
 
         private static object ActivePowerPoint()
@@ -248,22 +286,25 @@ namespace MathTypeInjector
             if (left > slideWidth - 120.0) left = Math.Max(0.0, slideWidth - 120.0);
             if (top > slideHeight - 60.0) top = Math.Max(0.0, slideHeight - 60.0);
 
-            dynamic shape = slide.Shapes.AddOLEObject(left, top, 200.0, 60.0, "Equation.DSMT4", "", false, "", 0, false);
-            dynamic oleFormat = shape.OLEFormat;
-            oleFormat.DoVerb(2);
-            System.Threading.Thread.Sleep(120);
-            object raw = oleFormat.Object;
-            ComIDataObject dataObject = raw as ComIDataObject;
-            IOleObject oleObject = raw as IOleObject;
-            if (dataObject == null)
-                throw new InvalidOperationException("Equation.DSMT4 没有暴露 IDataObject，无法写入公式内容。");
-            SetUnicodeData(dataObject, formatName, formula);
-            if (oleObject != null)
+            dynamic shape = null;
+            StartMathTypeWindowHider(GetForegroundWindow());
+            try
             {
-                int hr = oleObject.Close(OLECLOSE_SAVEIFDIRTY);
-                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
-            }
-            System.Threading.Thread.Sleep(120);
+                shape = slide.Shapes.AddOLEObject(left, top, 200.0, 60.0, "Equation.DSMT4", "", false, "", 0, false);
+                HideMathTypeEditorWindows();
+                dynamic oleFormat = shape.OLEFormat;
+                object raw = GetOleDataObject(oleFormat);
+                ComIDataObject dataObject = raw as ComIDataObject;
+                IOleObject oleObject = raw as IOleObject;
+                if (dataObject == null)
+                    throw new InvalidOperationException("Equation.DSMT4 没有暴露 IDataObject，无法写入公式内容。");
+                SetUnicodeData(dataObject, formatName, formula);
+                if (oleObject != null)
+                {
+                    int hr = oleObject.Close(OLECLOSE_SAVEIFDIRTY);
+                    if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                }
+                System.Threading.Thread.Sleep(120);
 
             // PowerPoint resizes the shape to fit the equation after the data is set;
             // keep the whole shape inside the slide.
@@ -279,10 +320,106 @@ namespace MathTypeInjector
             }
             catch (COMException) { }
 
-            Console.WriteLine(
-                "{\"ok\":true,\"target\":\"ppt\",\"width\":\"" +
-                width.ToString("0.###", CultureInfo.InvariantCulture) +
-                "\",\"height\":\"" + height.ToString("0.###", CultureInfo.InvariantCulture) + "\"}");
+                Console.WriteLine(
+                    "{\"ok\":true,\"target\":\"ppt\",\"width\":\"" +
+                    width.ToString("0.###", CultureInfo.InvariantCulture) +
+                    "\",\"height\":\"" + height.ToString("0.###", CultureInfo.InvariantCulture) + "\"}");
+            }
+            catch
+            {
+                try { if (shape != null) shape.Delete(); } catch { }
+                throw;
+            }
+            finally
+            {
+                StopMathTypeWindowHider();
+            }
+        }
+
+        private static volatile bool HiderStop;
+        private static System.Threading.Thread HiderThread;
+        private static IntPtr RestoreForeground = IntPtr.Zero;
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        /// <summary>
+        /// Word creates Equation.DSMT4 through an out-of-process server and MathType
+        /// opens its editor window (class EQNWINCLASS) while the object is created.
+        /// Hiding that window while we feed the data keeps the focus in Word.
+        /// </summary>
+        private static void HideMathTypeEditorWindows()
+        {
+            bool hidden = false;
+            try
+            {
+                EnumWindows((hWnd, lParam) =>
+                {
+                    try
+                    {
+                        if (!IsWindowVisible(hWnd)) return true;
+                        StringBuilder cls = new StringBuilder(64);
+                        GetClassName(hWnd, cls, cls.Capacity);
+                        if (cls.ToString() == "EQNWINCLASS")
+                        {
+                            ShowWindow(hWnd, 0); // SW_HIDE
+                            hidden = true;
+                        }
+                    }
+                    catch { }
+                    return true;
+                }, IntPtr.Zero);
+            }
+            catch { }
+            if (hidden && RestoreForeground != IntPtr.Zero)
+            {
+                // Hiding the editor is not always enough: Windows may leave it as the
+                // foreground window for ~200 ms. Hand focus back explicitly.
+                try { SetForegroundWindow(RestoreForeground); } catch { }
+            }
+        }
+
+        private static void StartMathTypeWindowHider(IntPtr restoreForeground)
+        {
+            RestoreForeground = restoreForeground;
+            HiderStop = false;
+            HiderThread = new System.Threading.Thread(() =>
+            {
+                while (!HiderStop)
+                {
+                    HideMathTypeEditorWindows();
+                    System.Threading.Thread.Sleep(10);
+                }
+            });
+            HiderThread.IsBackground = true;
+            HiderThread.Start();
+        }
+
+        private static void StopMathTypeWindowHider()
+        {
+            HiderStop = true;
+            if (HiderThread != null)
+            {
+                try { HiderThread.Join(800); } catch { }
+                HiderThread = null;
+            }
         }
 
         private static int Main(string[] args)
@@ -308,6 +445,12 @@ namespace MathTypeInjector
                 }
                 if (target != "word" && target != "ppt")
                     throw new ArgumentException("--target 只能是 word 或 ppt");
+                if (mode == "ping")
+                {
+                    // Cheap self-check used by helper.py before trusting a binary.
+                    Console.WriteLine("{\"ok\":true,\"mode\":\"ping\"}");
+                    return 0;
+                }
                 if (file == null) throw new ArgumentException("缺少 --file 参数");
                 string formula = File.ReadAllText(file, Encoding.UTF8);
                 if (formula.Trim().Length == 0) throw new ArgumentException("公式文件为空");

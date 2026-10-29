@@ -157,18 +157,24 @@ def normalize_latex(latex: str, *, brace_hint: bool | None = None) -> str:
     match = _ENV_RE.search(text)
     if match is not None:
         env = match.group("env")
+        converted = None
         if env in _MULTILINE_ENVS:
             rows = _split_rows(match.group("body"))
             joined = " \\\\ ".join(row.replace("&", "") for row in rows)
             if brace_hint:
-                return r"\left\{\begin{array}{l}" + joined + r"\end{array}\right."
-            return r"\begin{array}{l}" + joined + r"\end{array}"
-        if env == "cases":
+                converted = r"\left\{\begin{array}{l}" + joined + r"\end{array}\right."
+            else:
+                converted = r"\begin{array}{l}" + joined + r"\end{array}"
+        elif env == "cases":
             rows = _split_rows(match.group("body"))
             # MathType's cases template is single-column; a second column is laid
             # out with spacing instead of an alignment tab.
             joined = " \\\\ ".join(row.replace("&", r"\quad ") if "&" in row else row for row in rows)
-            return r"\begin{cases}" + joined + r"\end{cases}"
+            converted = r"\begin{cases}" + joined + r"\end{cases}"
+        if converted is not None:
+            # Keep whatever surrounds the environment, e.g. "f(x)=" in
+            # "f(x)=\begin{cases}..." or "+z" after an aligned block.
+            return text[: match.start()] + converted + text[match.end():]
 
     if "\\\\" in text and "\\begin{" not in text:
         rows = _split_rows(text)
@@ -206,7 +212,20 @@ def detect_left_brace(image_path: str) -> bool:
         left_width = max(2, int(width * 0.12))
         region = dark[y0 : y1 + 1, x0 : x0 + left_width]
         column_coverage = region.sum(axis=0)
-        return bool((column_coverage >= 0.55 * height).any())
+        if not bool((column_coverage >= 0.55 * height).any()):
+            return False
+        # A straight vertical stroke (matrix/absolute-value delimiter, table border)
+        # also covers one column. A curly brace's horizontal centroid moves along
+        # its height (hooks at top/bottom, cusp in the middle), so require spread.
+        centroids = []
+        for row in region:
+            columns = np.where(row)[0]
+            if columns.size:
+                centroids.append(float(columns.mean()))
+        if len(centroids) < max(4, int(height * 0.3)):
+            return False
+        spread = max(centroids) - min(centroids)
+        return spread >= max(2.0, width * 0.01)
     except Exception:
         return False
 
@@ -304,36 +323,125 @@ def find_csc() -> str:
     raise RunError("找不到 .NET Framework 编译器 csc.exe，无法构建 MathType 注入器。")
 
 
-def ensure_injector() -> Path:
-    if INJECTOR_EXE.exists() and INJECTOR_EXE.stat().st_size > 0:
-        try:
-            # Rebuild when the C# source changed (the exe is gitignored, so an
-            # older checkout may leave a stale binary behind).
-            if not INJECTOR_SRC.exists() or INJECTOR_EXE.stat().st_mtime >= INJECTOR_SRC.stat().st_mtime:
-                return INJECTOR_EXE
-        except OSError:
-            return INJECTOR_EXE
-    if not INJECTOR_SRC.exists():
-        raise RunError("找不到注入器源码：%s" % INJECTOR_SRC)
-    INJECTOR_DIR.mkdir(parents=True, exist_ok=True)
-    compiler = find_csc()
+_INJECTOR_VERIFIED = False
+_BUILD_LOCK_NAME = "MathTypeInjector.build.lock"
+
+
+def _injector_is_fresh() -> bool:
+    try:
+        if not INJECTOR_EXE.exists() or INJECTOR_EXE.stat().st_size <= 0:
+            return False
+        return not INJECTOR_SRC.exists() or INJECTOR_EXE.stat().st_mtime >= INJECTOR_SRC.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _injector_ping(exe: Path) -> bool:
+    """Run a built exe once; catches half-written binaries left by a killed csc."""
     try:
         proc = subprocess.run(
-            [compiler, "-nologo", "-target:exe", "-out:" + str(INJECTOR_EXE), str(INJECTOR_SRC)],
+            [str(exe), "--mode", "ping"],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=180,
+            timeout=20,
             creationflags=CREATE_NO_WINDOW,
         )
-    except subprocess.TimeoutExpired:
-        raise RunError("构建 MathType 注入器超时。") from None
-    if not INJECTOR_EXE.exists():
+    except Exception:
+        return False
+    if proc.returncode != 0:
+        return False
+    for line in reversed([line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]):
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        return isinstance(payload, dict) and payload.get("ok") is True and payload.get("mode") == "ping"
+    return False
+
+
+def _acquire_build_lock(timeout: float = 180.0) -> Path:
+    """Cross-process lock so the sidecar and the hotkey helper never compile at once."""
+    lock = INJECTOR_DIR / _BUILD_LOCK_NAME
+    INJECTOR_DIR.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode("ascii", "replace"))
+            finally:
+                os.close(fd)
+            return lock
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > 300:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.time() > deadline:
+                raise RunError("等待注入器编译锁超时：另一个进程正在构建 MathType 注入器。") from None
+            time.sleep(0.2)
+
+
+def _release_build_lock(lock: Path) -> None:
+    try:
+        lock.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def ensure_injector() -> Path:
+    global _INJECTOR_VERIFIED
+    if _injector_is_fresh():
+        if _INJECTOR_VERIFIED or _injector_ping(INJECTOR_EXE):
+            _INJECTOR_VERIFIED = True
+            return INJECTOR_EXE
+        try:
+            INJECTOR_EXE.unlink()
+        except OSError:
+            pass
+    if not INJECTOR_SRC.exists():
+        raise RunError("找不到注入器源码：%s" % INJECTOR_SRC)
+    INJECTOR_DIR.mkdir(parents=True, exist_ok=True)
+    lock = _acquire_build_lock()
+    tmp_exe = INJECTOR_DIR / ("MathTypeInjector.build.%d.exe" % os.getpid())
+    try:
+        # Another process may have finished the build while we waited for the lock.
+        if _injector_is_fresh() and _injector_ping(INJECTOR_EXE):
+            _INJECTOR_VERIFIED = True
+            return INJECTOR_EXE
+        compiler = find_csc()
+        try:
+            proc = subprocess.run(
+                [compiler, "-nologo", "-target:exe", "-out:" + str(tmp_exe), str(INJECTOR_SRC)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except subprocess.TimeoutExpired:
+            raise RunError("构建 MathType 注入器超时。") from None
         detail = ((proc.stdout or "") + (proc.stderr or "")).strip()[-800:]
-        raise RunError("构建 MathType 注入器失败：%s" % (detail or "csc 没有产生 exe"))
-    log("built injector:", INJECTOR_EXE)
-    return INJECTOR_EXE
+        if proc.returncode != 0 or not tmp_exe.exists() or tmp_exe.stat().st_size <= 0:
+            raise RunError("构建 MathType 注入器失败：%s" % (detail or "csc 没有产生 exe"))
+        # Atomic replace: readers never see a half-written exe.
+        os.replace(tmp_exe, INJECTOR_EXE)
+        if not _injector_ping(INJECTOR_EXE):
+            raise RunError("构建出的 MathType 注入器无法运行（自检失败）。")
+        _INJECTOR_VERIFIED = True
+        log("built injector:", INJECTOR_EXE)
+        return INJECTOR_EXE
+    finally:
+        try:
+            tmp_exe.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _release_build_lock(lock)
 
 
 TARGET_LABELS = {"word": "Word", "ppt": "PowerPoint"}
@@ -420,6 +528,10 @@ def run_request(request: dict, *, token: str, model: str) -> dict:
     if target not in TARGET_LABELS:
         raise RunError("未知的插入目标：%s（只支持 word / ppt）" % target)
     target_label = _target_label(target)
+    if os.environ.get("DSH_FORMULA_TEST_MODE") == "1":
+        # Used by test-harness.mjs so a test run can never OCR-upload a screenshot
+        # or insert a formula into the user's open Word/PowerPoint document.
+        raise RunError("测试模式：跳过真实识别与插入（DSH_FORMULA_TEST_MODE=1）。")
 
     cleanup_path: str | None = None
     try:
@@ -453,7 +565,8 @@ def run_request(request: dict, *, token: str, model: str) -> dict:
         except Exception as exc:
             _set_clipboard_text(latex)
             raise RunError(
-                "%s\n(公式 LaTeX 已复制到系统剪贴板，可手动粘贴到 %s 后用 MathType 转换。)" % (exc, target_label),
+                "%s\n(公式 LaTeX 已复制到系统剪贴板，原截图已被覆盖；如需重试请重新截图。"
+                "也可以手动粘贴到 %s 后用 MathType 转换。)" % (exc, target_label),
                 latex=latex,
                 conf=conf,
             ) from exc
@@ -525,6 +638,11 @@ def serve(*, token_file: str, model: str) -> int:
                     log("warmup failed:", exc)
                     respond(id=request_id, ok=False, error=str(exc))
                 continue
+            if action != "run":
+                # Fail closed: unknown actions must not fall through to a real
+                # OCR + insertion (previously {"action":"bogus"} did exactly that).
+                respond(id=request_id, ok=False, error="未知 action：%s" % action)
+                continue
             try:
                 if not token:
                     token = read_token(token_file)
@@ -544,6 +662,109 @@ def serve(*, token_file: str, model: str) -> int:
                 respond(id=request_id, ok=False, error="内部错误：%s" % exc)
     finally:
         log("sidecar exiting")
+    return 0
+
+
+def selftest() -> int:
+    """Offline checks for the pure helpers; run via ``helper.py selftest``."""
+    failures = 0
+
+    def check(name: str, condition: bool, detail: str = "") -> None:
+        nonlocal failures
+        if condition:
+            print("PASS  %s" % name)
+        else:
+            failures += 1
+            print("FAIL  %s :: %s" % (name, detail))
+
+    cases = [
+        (
+            r"y=\begin{aligned}a&=b\\c&=d\end{aligned}+z",
+            r"y=\begin{array}{l}a=b \\ c=d\end{array}+z",
+        ),
+        (
+            r"f(x)=\begin{cases}1,&x>0\\0,&x\le 0\end{cases}",
+            r"f(x)=\begin{cases}1,\quad x>0 \\ 0,\quad x\le 0\end{cases}",
+        ),
+        (r"\begin{align*}a&=b\\c&=d\end{align*}", r"\begin{array}{l}a=b \\ c=d\end{array}"),
+        (r"\frac{a}{b}", r"\frac{a}{b}"),
+    ]
+    for index, (source, expected) in enumerate(cases):
+        got = normalize_latex(source)
+        check("normalize case %d" % index, got == expected, "got %r" % got)
+
+    check(
+        "normalize keeps brace with prefix",
+        normalize_latex(r"y=\begin{aligned}a&=b\\c&=d\end{aligned}", brace_hint=True)
+        == r"y=\left\{\begin{array}{l}a=b \\ c=d\end{array}\right.",
+    )
+
+    try:
+        from hotkey_runner import parse_hotkey
+
+        modifiers, vk = parse_hotkey("Ctrl+Alt+F")
+        check("parse_hotkey Ctrl+Alt+F", (modifiers & 0x0007) == 0x0003 and vk == 0x46, "%s %s" % (modifiers, vk))
+        bad = False
+        try:
+            parse_hotkey("F")
+        except ValueError:
+            bad = True
+        check("parse_hotkey rejects bare key", bad)
+    except Exception as exc:  # noqa: BLE001 - selftest reports, does not raise
+        check("parse_hotkey import", False, repr(exc))
+
+    try:
+        import tempfile
+
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vertical = Path(tmp) / "line.png"
+            image = Image.new("L", (200, 200), 255)
+            ImageDraw.Draw(image).rectangle([10, 10, 16, 190], fill=0)
+            image.save(vertical)
+            check("detect_left_brace rejects straight vertical line", detect_left_brace(str(vertical)) is False)
+
+            plain = Path(tmp) / "plain.png"
+            image = Image.new("L", (200, 200), 255)
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([40, 60, 60, 80], fill=0)
+            draw.rectangle([100, 60, 130, 80], fill=0)
+            image.save(plain)
+            check("detect_left_brace skips simple formula", detect_left_brace(str(plain)) is False)
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            with tempfile.TemporaryDirectory() as tmp:
+                brace_png = Path(tmp) / "brace.png"
+                fig = plt.figure(figsize=(3, 1.6), dpi=200)
+                fig.text(0.05, 0.5, r"$\left\{\frac{a}{b}=\frac{c}{d}\right.$", fontsize=24, va="center")
+                fig.savefig(brace_png, facecolor="white", bbox_inches="tight", pad_inches=0.1)
+                plt.close(fig)
+                check("detect_left_brace finds a rendered brace", detect_left_brace(str(brace_png)) is True)
+        except ImportError:
+            print("SKIP  detect_left_brace positive (matplotlib not installed)")
+    except Exception as exc:  # noqa: BLE001
+        check("detect_left_brace environment", False, repr(exc))
+
+    # Test mode must short-circuit before clipboard/network/insertion.
+    os.environ["DSH_FORMULA_TEST_MODE"] = "1"
+    try:
+        run_request({"mode": "latex", "latex": "x^{2}", "target": "word"}, token="", model="standard")
+        check("test mode short-circuit", False, "run_request was not blocked")
+    except RunError as exc:
+        check("test mode short-circuit", "测试模式" in str(exc), str(exc))
+    finally:
+        os.environ.pop("DSH_FORMULA_TEST_MODE", None)
+
+    print("---")
+    if failures:
+        print("FAIL: %d selftest check(s) failed" % failures)
+        return 1
+    print("OK: helper selftest passed")
     return 0
 
 
@@ -568,12 +789,16 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--model", default="standard", choices=["turbo", "standard"])
     run_parser.add_argument("--target", default="word", choices=["word", "ppt"])
 
+    sub.add_parser("selftest", help="run offline self-tests for the pure helpers")
+
     hotkey_parser = sub.add_parser("hotkey", help="run the global-hotkey companion (B mode)")
     hotkey_parser.add_argument("--hotkey", default="Ctrl+Alt+F")
     hotkey_parser.add_argument("--token-file", default="")
     hotkey_parser.add_argument("--model", default="standard", choices=["turbo", "standard"])
 
     args = parser.parse_args(argv)
+    if args.command == "selftest":
+        return selftest()
     if args.command == "serve":
         return serve(token_file=args.token_file, model=args.model)
 

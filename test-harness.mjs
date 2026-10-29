@@ -2,14 +2,24 @@
  * Standalone harness: exercise the plugin without the DSH runtime.
  *
  * Mocks ctx.tools.register / ctx.commands.register / ctx.effect, verifies what
- * was registered, checks argument validation, drives one real sidecar request
- * through the command handler (expected to fail cleanly here because no Word
- * document is open in the harness environment), and finally checks the
- * `/formula hotkey status` subcommand of the B-mode companion.
+ * was registered, checks argument validation, drives sidecar requests through the
+ * command handler (in DSH_FORMULA_TEST_MODE they come back as deterministic
+ * errors, so no OCR/insertion can happen), runs the offline Python selftest, and
+ * finally checks the `/formula hotkey status` subcommand of the B-mode companion.
  *
  * Run with: node test-harness.mjs
  */
+import { spawnSync } from 'node:child_process'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { apply } from './index.js'
+
+const HERE = dirname(fileURLToPath(import.meta.url))
+
+// Never let a test run touch the real clipboard, spend an OCR call, or insert a
+// formula into a Word/PowerPoint document the user has open. helper.py returns a
+// deterministic "test mode" error instead.
+process.env.DSH_FORMULA_TEST_MODE = '1'
 
 let registeredTool = null
 let registeredCommand = null
@@ -72,31 +82,50 @@ await expectReject('mode=image without imagePath rejected', registeredTool.execu
 await expectReject('unknown mode rejected', registeredTool.execute({ mode: 'clipboard2' }))
 await expectReject('unknown target rejected', registeredTool.execute({ mode: 'latex', latex: 'x', target: 'excel' }))
 
-// Real sidecar round trip: with no clipboard image (or no Word) this must come
-// back as a clean {kind:'error'} result, not a crash.
-const commandResult = await registeredCommand.handler({ rawInput: '' })
-check('command returns structured result', commandResult?.kind === 'success' || commandResult?.kind === 'error', JSON.stringify(commandResult))
-check('command error path is reported', commandResult?.kind === 'error', JSON.stringify(commandResult))
-if (commandResult?.kind === 'error') {
-  console.log('  sidecar error text :', String(commandResult.text).split('\n')[0])
+// Offline Python selftest: normalize_latex / brace detection / hotkey parsing /
+// test-mode guard. Kept in helper.py so it can import the real functions.
+const python = [process.env.DSH_FORMULA_TEST_PYTHON, process.env.DSH_FORMULA_PYTHON, 'D:/Program Files/python.exe', 'python3', 'python']
+  .filter((candidate) => typeof candidate === 'string' && candidate.length > 0)
+  .find((candidate) => spawnSync(candidate, ['-c', 'import sys'], { windowsHide: true }).error === undefined)
+if (python) {
+  const selftest = spawnSync(python, [join(HERE, 'helper.py'), 'selftest'], { encoding: 'utf8', windowsHide: true })
+  check('python helper selftest', selftest.status === 0, String(selftest.stdout ?? selftest.stderr ?? selftest.error).slice(-400))
+  if (selftest.status !== 0) console.log(String(selftest.stdout ?? '').split('\n').slice(-12).join('\n'))
+} else {
+  check('python helper selftest', false, 'no python interpreter found')
 }
 
-// PowerPoint routing: /formula ppt must reach the sidecar and come back with a
-// structured result (success if a slide is open and the clipboard has an image,
-// otherwise a clean error — never a crash).
+// Sidecar round trip: in test mode helper.py must refuse before reading the
+// clipboard or inserting anything, and the command must report it cleanly.
+const commandResult = await registeredCommand.handler({ rawInput: '' })
+check('command test-mode error returned', commandResult?.kind === 'error', JSON.stringify(commandResult))
+check('command test-mode error text', String(commandResult?.text ?? '').includes('测试模式'), JSON.stringify(commandResult))
+console.log('  sidecar error text :', String(commandResult?.text ?? '').split('\n')[0])
+
+// PowerPoint routing: /formula ppt must reach the sidecar with target=ppt.
 const pptResult = await registeredCommand.handler({ rawInput: 'ppt' })
-check('ppt command returns structured result', pptResult?.kind === 'success' || pptResult?.kind === 'error', JSON.stringify(pptResult))
+check(
+  'ppt command reaches sidecar',
+  pptResult?.kind === 'error' && String(pptResult?.text ?? '').includes('测试模式'),
+  JSON.stringify(pptResult),
+)
 console.log('  ppt command text  :', String(pptResult?.text ?? '').split('\n')[0])
 
 // B mode: the hotkey companion starts after the sidecar warm-up. Give it a
 // moment, then verify the status subcommand wired into /formula.
 await new Promise((resolve) => setTimeout(resolve, 2500))
 const hotkeyStatus = await registeredCommand.handler({ rawInput: 'hotkey status' })
+const hotkeyText = String(hotkeyStatus?.text ?? '')
+const externalHelper = hotkeyText.includes('另一个热键助手已在运行')
 check(
   'hotkey status command',
-  hotkeyStatus?.kind === 'success' && typeof hotkeyStatus.text === 'string' && hotkeyStatus.text.includes('热键'),
+  hotkeyStatus?.kind === 'success' &&
+    hotkeyText.includes('热键') &&
+    hotkeyText.includes('Ctrl+Alt+F') &&
+    (hotkeyText.includes('运行中') || externalHelper),
   JSON.stringify(hotkeyStatus),
 )
+if (externalHelper) console.log('  (skipped: a DSH-managed hotkey helper is already running)')
 console.log('  hotkey status text :', String(hotkeyStatus?.text ?? '').split('\n').join(' / '))
 const hotkeyOff = await registeredCommand.handler({ rawInput: 'hotkey off' })
 check('hotkey off command', hotkeyOff?.kind === 'success', JSON.stringify(hotkeyOff))

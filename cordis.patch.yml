@@ -3,10 +3,11 @@
 # One formula pipeline:
 #   clipboard screenshot -> SimpleTex formula OCR -> LaTeX (normalized)
 #   -> injector/MathTypeInjector.exe -> real MathType OLE object (Equation.DSMT4)
-#   inserted at the caret of the active Word document.
+#   inserted at the caret of the active Word document, or on the current
+#   PowerPoint slide (target=ppt).
 #
 # Requirements on this machine: MathType 7 installed (Equation.DSMT4 registered),
-# Microsoft Word desktop, Python with requests + Pillow + numpy, and the .NET
+# Microsoft Word and/or PowerPoint desktop, Python with requests + Pillow + numpy, and the .NET
 # Framework compiler (csc.exe, ships with Windows) used to build the injector.
 - insert:
     - id: formula-mathtype

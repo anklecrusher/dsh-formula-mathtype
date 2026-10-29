@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-formula-mathtype",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
-  "description": "Screenshot formula -> SimpleTex OCR -> real MathType OLE equation inserted into the active Word document.",
+  "description": "Screenshot formula -> SimpleTex OCR -> real MathType OLE equation inserted into the active Word document or PowerPoint slide.",
   "main": "./entry.js",
   "exports": {
     ".": "./entry.js"

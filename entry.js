@@ -23,7 +23,7 @@ export const inject = ['tools', 'commands']
 /**
  * Load the implementation fresh and delegate activation to it.
  * @param ctx - plugin context carrying `tools` and `commands`.
- * @param config - plugin config (pythonPath, helperPath, tokenFile, model).
+ * @param config - plugin config (pythonPath, helperPath, tokenFile, model, hotkey).
  * @returns the implementation's activation result.
  */
 export async function apply(ctx, config) {

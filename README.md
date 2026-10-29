@@ -27,7 +27,7 @@ injector/MathTypeInjector.exe（Word / PowerPoint COM + MathType OLE）
 Word 光标处 / PPT 当前幻灯片：可编辑的 MathType 公式
 ```
 
-不弹 MathType 窗口、不运行 Word 宏、不依赖 Office PIA。注入器是 C# 源码，首次使用由 `helper.py` 调 Windows 自带的 `.NET Framework` 编译器（`csc.exe`）自动构建。
+不运行 Word 宏、不依赖 Office PIA；MathType 编辑器窗口在创建 OLE 对象时会被立即隐藏，不会抢焦点（实测插入期间前台窗口采样 0 次 MathType）。注入器是 C# 源码，首次使用由 `helper.py` 调 Windows 自带的 `.NET Framework` 编译器（`csc.exe`）自动构建。
 
 ## 实测性能（本机 MathType 7.11.1 + Word Office16）
 
@@ -58,7 +58,7 @@ Word 光标处 / PPT 当前幻灯片：可编辑的 MathType 公式
 | `injector/MathTypeInjector.cs` | Word / PowerPoint COM + MathType OLE 注入器源码（首次使用自动编译） |
 | `hotkey_runner.py` | B 模式常驻助手：全局热键 + 原生 Win32 toast + 复用插入逻辑 |
 | `cordis.patch.yml` | 插件行与默认配置 |
-| `test-harness.mjs` | 不依赖 DSH 的离线自测 |
+| `test-harness.mjs` | 不依赖 DSH 的离线自测（`DSH_FORMULA_TEST_MODE=1` 时不会真实 OCR/插入；同时跑 `helper.py selftest`） |
 
 ## 依赖
 
@@ -120,9 +120,11 @@ PowerPoint 的插入位置：当前幻灯片居中；如果先选中了一个形
 
 实测：Word 里简单公式从按键到插入约 **1.2–2.5 秒**，PPT 里约 **3–5 秒**（多了 PowerPoint OLE 激活开销，主要仍是标准模型识别时间）；6 行方程组约 10 秒。前台既不是 Word 也不是 PowerPoint 时会弹红色提示「请先切到 Word 或 PowerPoint」，不会误插。提示窗口是无激活（`WS_EX_NOACTIVATE`）的原生 Win32 分层窗口，不会抢焦点；本机 Python 的 Tcl/Tk 数据不完整，所以没有用 Tkinter。
 
-热键用低级键盘钩子（`WH_KEYBOARD_LL`）实现：按下 `Ctrl+Alt+F` 时组合键会被吞掉，**不会触发 Word 自带的「插入脚注」**（Word 里 `Ctrl+Alt+F` 正是插入脚注快捷键，已实测确认）。因为组合键不含单独的 Alt，不会触发 Word 的键位提示。
+热键用低级键盘钩子（`WH_KEYBOARD_LL`）实现：按下 `Ctrl+Alt+F` 时组合键会被吞掉，**不会触发 Word 自带的「插入脚注」**（Word 里 `Ctrl+Alt+F` 正是插入脚注快捷键，已实测确认）。因为组合键含 Ctrl（Ctrl+Alt 不会触发 Word 的键位提示），所以不需要额外发 Esc 清理。
 
-副作用：插件运行期间，Word 的 `Ctrl+Alt+F` 插入脚注快捷键会被本插件占用；需要插脚注时用「引用 → 插入脚注」功能区按钮。
+副作用：插件运行期间，Word 的 `Ctrl+Alt+F` 插入脚注快捷键会被本插件占用；需要插脚注时用「引用 → 插入脚注」功能区按钮。热键对所有前台程序都生效（不只 Word/PPT），换取的是不切窗口就能插入。
+
+排查信息：`hotkey.log` 会记录每次插入的 LaTeX 片段（最多 300 字符）与错误原因，方便定位；如果公式内容敏感，可定期清空该文件。
 
 启用/关闭/查看状态：
 
@@ -178,6 +180,8 @@ PowerPoint 的插入位置：当前幻灯片居中；如果先选中了一个形
 | 提示“另一个热键助手已在运行” | 上次 DSH 异常退出留下的进程：任务管理器结束对应 `python.exe`（命令行含 `helper.py hotkey`）后 `/formula hotkey restart` |
 | 按热键没反应 | 先在 Word 里确认光标位置；再 `/formula hotkey status` 看助手是否在运行；详细过程见 `hotkey.log` |
 | 按 `Ctrl+Alt+F` 后 Word 多出一个脚注 | 说明键盘钩子没生效（助手未运行或被安全软件拦截），`/formula hotkey status` 查看 |
+| 插入失败后剪贴板变成 LaTeX | 这是失败兜底：原截图已被覆盖，公式 LaTeX 留在剪贴板里可手动粘贴；重试请重新截图 |
+| 测试时不想真的插入公式 | 跑 `node test-harness.mjs` 即可：它设置 `DSH_FORMULA_TEST_MODE=1`，helper 会直接返回测试错误，不 OCR、不插入 |
 
 ## 限制
 

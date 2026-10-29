@@ -1,6 +1,6 @@
 /**
  * dsh-formula-mathtype — screenshot formula -> SimpleTex OCR -> real MathType
- * equation inserted into the active Word document.
+ * equation inserted into the active Word document or PowerPoint slide.
  *
  * How the pieces fit
  * ------------------
@@ -41,7 +41,7 @@
  * @module @local/dsh-formula-mathtype
  */
 
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -104,14 +104,37 @@ function resolvePythonPath(config) {
   return 'python'
 }
 
-/** One formula should never take longer than this; OCR + Word COM included. */
-const REQUEST_TIMEOUT_MS = 180_000
+/** One formula should never take longer than this; OCR (90 s) + injector (120 s) included. */
+const REQUEST_TIMEOUT_MS = 240_000
 
 /** Timeout for the non-blocking MathType engine warm-up at plugin load. */
 const WARMUP_TIMEOUT_MS = 60_000
 
 /** Default system-wide hotkey for the B-mode companion. */
 const DEFAULT_HOTKEY = 'Ctrl+Alt+F'
+
+/**
+ * Kill a child process *and its descendants*. On Windows `child.kill()` leaves the
+ * injector that the Python sidecar spawned running, which could finish inserting a
+ * formula after the host already reported a timeout. taskkill /T handles that.
+ * @param {import('node:child_process').ChildProcess | null} child
+ */
+function terminateChildTree(child) {
+  if (child === null || child === undefined || child.pid === undefined) return
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+      return
+    }
+  } catch {
+    /* fall through to child.kill() */
+  }
+  try {
+    child.kill()
+  } catch {
+    /* already gone */
+  }
+}
 
 /**
  * Persistent JSON-lines client for helper.py.
@@ -179,6 +202,7 @@ class PythonSidecar {
       this.stderrTail = (this.stderrTail + chunk).slice(-4000)
     })
     child.on('error', (error) => {
+      if (this.child !== child) return
       this.child = null
       const hint =
         error?.code === 'ENOENT'
@@ -187,11 +211,16 @@ class PythonSidecar {
       this.failAll(new Error(`公式 sidecar 启动失败：${error.message}${hint}`))
     })
     child.on('exit', (code, signal) => {
+      // A reset()/dispose() may already have replaced this child; a late exit event
+      // must not kill the *next* sidecar or reject its requests.
+      if (this.child !== child) return
       this.child = null
       this.failAll(
         new Error(`公式 sidecar 进程退出 (code=${code}, signal=${signal})：${this.stderrTail.slice(-1500)}`),
       )
     })
+    // Writes to a dead child must not surface as an unhandled stream error.
+    child.stdin.on('error', () => {})
   }
 
   /** Feed stdout bytes through the line protocol. @param {string} chunk */
@@ -269,11 +298,7 @@ class PythonSidecar {
       } catch {
         /* already closed */
       }
-      try {
-        child.kill()
-      } catch {
-        /* already gone */
-      }
+      terminateChildTree(child)
     }
   }
 
@@ -282,11 +307,7 @@ class PythonSidecar {
     const child = this.child
     this.child = null
     if (child === null) return
-    try {
-      child.kill()
-    } catch {
-      /* already gone */
-    }
+    terminateChildTree(child)
   }
 
   /** Graceful shutdown, called when the plugin is disposed. */
@@ -296,18 +317,20 @@ class PythonSidecar {
     const child = this.child
     this.child = null
     this.failAll(new Error('公式 sidecar 已关闭'))
-    if (child === null) return
+    if (child === null) {
+      process.removeListener('exit', this.exitHook)
+      return
+    }
     try {
       child.stdin.write(`${JSON.stringify({ id: 0, action: 'quit' })}\n`)
     } catch {
       /* already closed */
     }
     const timer = setTimeout(() => {
-      try {
-        child.kill()
-      } catch {
-        /* already gone */
-      }
+      terminateChildTree(child)
+      // Remove only after the child is gone; if the app exits before this fires,
+      // the exit hook still takes the sidecar down.
+      process.removeListener('exit', this.exitHook)
     }, 800)
     if (typeof timer.unref === 'function') timer.unref()
   }
@@ -317,7 +340,7 @@ class PythonSidecar {
  * Resident global-hotkey companion (`helper.py hotkey`, the B mode).
  *
  * It is a separate Python process on purpose: it owns a Win32 hotkey message
- * loop and a small Tk toast, so it must not share stdin/stdout with the JSON
+ * loop and a native Win32 toast, so it must not share stdin/stdout with the JSON
  * sidecar. Feedback goes to a toast and to
  * `%LOCALAPPDATA%\dsh-formula-mathtype\hotkey.log`.
  */
@@ -379,7 +402,8 @@ class HotkeyCompanion {
       this.lastError = `热键助手启动失败：${error.message}`
     })
     child.on('exit', (code, signal) => {
-      if (this.child === child) this.child = null
+      if (this.child !== child) return
+      this.child = null
       if (code !== 0 && code !== null) {
         const tail = this.stderrTail.trim().split('\n').slice(-3).join(' ')
         this.lastError = `热键助手退出 (code=${code}, signal=${signal})：${tail || '见 hotkey.log'}`
@@ -393,11 +417,13 @@ class HotkeyCompanion {
     const child = this.child
     this.child = null
     if (child === null) return
-    try {
-      child.kill()
-    } catch {
-      /* already gone */
-    }
+    terminateChildTree(child)
+  }
+
+  /** Stop and detach the process-exit hook (called when the plugin is disposed). */
+  dispose() {
+    this.stop()
+    process.removeListener('exit', this.exitHook)
   }
 
   /** Snapshot for the `/formula hotkey status` command. */
@@ -428,7 +454,7 @@ async function handleHotkeyCommand(companion, sub) {
     return { kind: 'success', text: lines.join('\n') }
   }
   if (action === 'on' || action === 'start') {
-    if (companion.options.hotkey && companion.options.hotkey.length === 0) {
+    if (!companion.options.hotkey) {
       return { kind: 'error', text: '未配置 hotkey：请在 cordis.patch.yml 的插件配置里填写 hotkey（如 Ctrl+Alt+F）。' }
     }
     companion.start()
@@ -679,7 +705,7 @@ export function apply(ctx, config) {
   if (typeof ctx.effect === 'function') {
     ctx.effect(
       () => () => {
-        hotkey.stop()
+        hotkey.dispose()
         sidecar.dispose()
       },
       'dsh-formula-mathtype: sidecar + hotkey companion',
@@ -693,7 +719,11 @@ export function apply(ctx, config) {
   // companion so the two processes never compile the injector at the same time.
   sidecar.request({ action: 'warmup' }, WARMUP_TIMEOUT_MS).then(
     () => hotkey.start(),
-    () => hotkey.start(),
+    (error) => {
+      // Do not hide a misconfigured pythonPath; surface it in the host console.
+      console.warn('[dsh-formula-mathtype] 预热失败：' + (error instanceof Error ? error.message : String(error)))
+      hotkey.start()
+    },
   )
 }
 
