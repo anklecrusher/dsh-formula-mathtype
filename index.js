@@ -118,6 +118,11 @@ class PythonSidecar {
     this.pending = new Map()
     this.nextId = 1
     this.disposed = false
+    // Last-resort cleanup: if the host process exits while the sidecar is still
+    // alive (app quit, crash), take the child down with it. Without this the
+    // Python process and MathType's engine can outlive the app.
+    this.exitHook = () => this.killChild()
+    process.once('exit', this.exitHook)
   }
 
   /** True when the child process is alive and usable. */
@@ -255,6 +260,18 @@ class PythonSidecar {
       } catch {
         /* already gone */
       }
+    }
+  }
+
+  /** Kill the child immediately (no graceful quit). */
+  killChild() {
+    const child = this.child
+    this.child = null
+    if (child === null) return
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
     }
   }
 

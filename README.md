@@ -23,7 +23,7 @@ Word COM（GetActiveObject("Word.Application") + Selection.Paste）
 活动文档光标处：可编辑的 MathType 公式
 ```
 
-实测（本机 MathType 7.11.1 + Word Office16）：热态下 LaTeX→MathType OLE 转换约 **0.04–0.13 秒/条**，Word 粘贴约 0.3–0.5 秒；不弹 MathType 窗口、不运行 Word 宏。
+实测（本机 MathType 7.11.1 + Word Office16）：热态下 LaTeX→MathType OLE 转换约 **0.04–0.13 秒/条**，Word 粘贴约 0.3–0.5 秒；不弹 MathType 窗口、不运行 Word 宏。完整链路（截图→OCR→插入）冷启动约 7 秒（Python/MathType 引擎启动），之后每条约 **0.4–1.5 秒**（大部分是 OCR 网络时间）。插件加载后会预热 sidecar（常驻 Python + MathType 引擎，约 70–90 MB 内存），换取第一条公式也不慢。
 
 ## 组件
 
@@ -59,6 +59,16 @@ Word COM（GetActiveObject("Word.Application") + Selection.Paste）
    & "D:\Users\ankle crusher\AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" `
        plugin --profile desktop add "@local/dsh-formula-mathtype@link:E:/GitHubWorkspace/own/opensource/dsh-formula-mathtype"
    ```
+
+   > 注意：这个版本的 `dsh plugin add` 只是把参数转发给 pnpm，**不会自动写 `dsh.profile.bundles`**。安装成功后还要把 `"@local/dsh-formula-mathtype"` 加进 profile `package.json` 的 `dsh.profile.bundles`（放在 `@local/dsh-latex-tool` 后面即可）。
+   >
+   > 若 pnpm 11 报 `ERR_PNPM_IGNORED_BUILDS`（本机是 `protobufjs`），先在 profile 目录批准一次构建：
+   > ```powershell
+   > & "D:\Users\ankle crusher\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe" --expose-internals `
+   >   "D:\Users\ankle crusher\AppData\Local\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.mjs" `
+   >   approve-builds protobufjs
+   > ```
+   > 它会在 `profile/pnpm-workspace.yaml` 里写入 `allowBuilds: { protobufjs: true }`；不修的话之后任何插件安装都会被这个严格构建检查挡住。
 
 5. 重启 DSH 桌面端（bundle 行在启动时读取），之后 `/` 命令列表里会出现 `formula`。
 
