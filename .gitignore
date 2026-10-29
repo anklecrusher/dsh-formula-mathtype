@@ -1,4 +1,6 @@
 node_modules/
 __pycache__/
 *.pyc
+injector/*.exe
+injector/*.pdb
 .DS_Store

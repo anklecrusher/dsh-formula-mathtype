@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-formula-mathtype",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Screenshot formula -> SimpleTex OCR -> real MathType OLE equation inserted into the active Word document.",

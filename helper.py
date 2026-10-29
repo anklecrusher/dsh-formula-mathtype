@@ -2,54 +2,55 @@
 # -*- coding: utf-8 -*-
 """Windows sidecar for @local/dsh-formula-mathtype.
 
-What it does
-------------
 One request inserts one formula into the *active* Word document:
 
 1. read the formula image from the Windows clipboard (or a file path),
 2. POST it to the SimpleTex formula-recognition open API and take ``res.latex``,
-3. hand that LaTeX to MathType's own SDK interface (``MT6.dll``:
-   ``MTAPIConnect`` / ``MTXFormSetTranslator`` / ``MTXFormEqn``), which puts a
-   real MathType OLE object (``Equation.DSMT4``) on the clipboard,
-4. paste it into Word through Word COM (``GetActiveObject`` + ``Selection.Paste``).
+3. normalize the LaTeX into the subset MathType's TeX parser accepts
+   (``aligned`` -> ``array``; a tall left brace in the source image is restored
+   with ``\\left\\{...\\right.``),
+4. hand it to ``injector/MathTypeInjector.exe``, which creates a real MathType
+   OLE object (``Equation.DSMT4``) at the caret through Word COM and feeds the
+   equation server its ``TeX Input Language`` clipboard format.
 
-No MathType window is opened, no Word macro runs, and no image or OMML is
-involved: the result is an editable MathType equation object.
+Why the injector is a separate C# executable: creating the OLE object and
+talking to its ``IDataObject`` needs COM interfaces that MathType's SDK
+``MTXFormEqn`` cannot provide in the text -> equation direction (it is an
+export API; used backwards, Word embeds the literal LaTeX text, which appears
+as plain source or as a black block). See injector/MathTypeInjector.cs. The exe
+is compiled from source on first use with the .NET Framework compiler that
+ships with Windows; no Office PIA or prebuilt binary is required.
 
 Protocol (``serve`` mode, one JSON object per line on stdin/stdout)::
 
     -> {"id": 1, "action": "run", "mode": "clipboard"}
     -> {"id": 2, "action": "run", "mode": "latex", "latex": "\\frac{a}{b}"}
     -> {"id": 3, "action": "run", "mode": "image", "imagePath": "C:/x.png"}
-    <- {"id": 1, "ok": true, "latex": "...", "conf": 0.95, "inserted": 1, ...}
+    <- {"id": 1, "ok": true, "latex": "...", "raw_latex": "...", "conf": 0.95, "elapsedMs": 1234}
     <- {"id": 2, "ok": false, "error": "..."}
 
 The token is read from the file configured with ``--token-file`` (default:
-``%LOCALAPPDATA%\\dsh-formula-mathtype\\simpletex.token``). The token is never
-printed or written anywhere else.
+``%LOCALAPPDATA%\\dsh-formula-mathtype\\simpletex.token``). It is never printed
+or written anywhere else.
 """
 
 from __future__ import annotations
 
 import argparse
-import ctypes
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 PROG = "formula-mathtype"
-
-# MathType MT6.dll SDK constants (from the MathType SDK / mtsdk.h).
-TRANSLATOR_SLOT = 4
-LOCAL_BUFFER_SOURCE = -3
-CLIPBOARD_SOURCE = -2
-FORMAT_TEXT = 7
-FORMAT_MATHTYPE_OLE = 6
-LATEX_TRANSLATOR = b"LaTeX.tdl"
+BASE_DIR = Path(__file__).resolve().parent
+INJECTOR_DIR = BASE_DIR / "injector"
+INJECTOR_SRC = INJECTOR_DIR / "MathTypeInjector.cs"
+INJECTOR_EXE = INJECTOR_DIR / "MathTypeInjector.exe"
 
 SIMPLETEX_TURBO_URL = "https://server.simpletex.cn/api/latex_ocr_turbo"
 SIMPLETEX_STANDARD_URL = "https://server.simpletex.cn/api/latex_ocr"
@@ -67,6 +68,9 @@ MIME_BY_SUFFIX = {
     ".tif": "image/tiff",
     ".tiff": "image/tiff",
 }
+
+CREATE_NO_WINDOW = 0x08000000
+INJECTOR_TIMEOUT_SECONDS = 120
 
 
 class RunError(RuntimeError):
@@ -105,196 +109,105 @@ def read_token(path: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# MathType: LaTeX -> clipboard MathType OLE object, via the MT6.dll SDK API
+# LaTeX normalization for MathType's TeX input parser
 # --------------------------------------------------------------------------
 
-def _strip_exe_path(command: str) -> str:
-    command = (command or "").strip()
-    if not command:
-        return ""
-    if command.startswith('"'):
-        end = command.find('"', 1)
-        return command[1:end] if end > 1 else command.strip('"')
-    match = re.search(r"\.exe", command, flags=re.IGNORECASE)
-    return command[: match.end()] if match else command.split(" ")[0]
+_MULTILINE_ENVS = {"aligned", "align", "align*", "gathered", "split", "alignat", "alignat*"}
+_ENV_RE = re.compile(
+    r"\\begin\{(?P<env>[A-Za-z*]+)\}(?:\[[^\]]*\])?(?:\{[^{}]*\})?(?P<body>.*?)\\end\{(?P=env)\}",
+    re.S,
+)
 
 
-def find_mathtype_dll() -> Path:
-    """Locate the MT6.dll that matches this Python's bitness."""
-    candidates: list[Path] = []
-    try:
-        import winreg
+def _strip_wrappers(latex: str) -> str:
+    text = latex.strip()
+    while True:
+        if len(text) >= 4 and (
+            (text.startswith("$$") and text.endswith("$$"))
+            or (text.startswith("\\[") and text.endswith("\\]"))
+            or (text.startswith("\\(") and text.endswith("\\)"))
+        ):
+            text = text[2:-2].strip()
+        elif len(text) >= 2 and text.startswith("$") and text.endswith("$"):
+            text = text[1:-1].strip()
+        else:
+            return text
 
-        with winreg.OpenKey(
-            winreg.HKEY_CLASSES_ROOT,
-            r"CLSID\{0002CE03-0000-0000-C000-000000000046}\LocalServer32",
-        ) as key:
-            raw, _ = winreg.QueryValueEx(key, "")
-        exe = _strip_exe_path(str(raw))
-        if exe:
-            root = Path(exe).resolve().parent
-            candidates.extend(
-                [
-                    root / "System" / "64" / "MT6.dll",
-                    root / "System" / "32" / "MT6.dll",
-                    root / "System" / "MT6.dll",
-                ]
-            )
-    except OSError:
-        pass
-    candidates.extend(
-        [
-            Path(r"C:\Program Files\MathType\System\64\MT6.dll"),
-            Path(r"C:\Program Files\MathType\System\32\MT6.dll"),
-            Path(r"C:\Program Files (x86)\MathType\System\64\MT6.dll"),
-            Path(r"C:\Program Files (x86)\MathType\System\32\MT6.dll"),
-        ]
+
+def _split_rows(body: str) -> list[str]:
+    return [row.strip() for row in re.split(r"\\\\", body) if row.strip()]
+
+
+def normalize_latex(latex: str, *, brace_hint: bool | None = None) -> str:
+    """Rewrite LaTeX into constructs MathType's "TeX Input Language" accepts.
+
+    Verified against MathType 7: ``array``/``matrix``/``cases``/``\\left\\{...\\right.``
+    are understood, while ``aligned``/``align``/``split``/``gathered`` are not and
+    would render as red error glyphs.
+    """
+    text = _strip_wrappers(latex)
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = re.sub(
+        r"\\(?:nonumber|notag|displaystyle|textstyle|scriptstyle|scriptscriptstyle)\b", "", text
     )
-    is_64bit = ctypes.sizeof(ctypes.c_void_p) == 8
-    preferred = [c for c in candidates if ("System\\64" in str(c) or "System/64" in str(c)) == is_64bit]
-    ordered = preferred + [c for c in candidates if c not in preferred]
-    for candidate in ordered:
-        if candidate.exists():
-            return candidate
-    raise RunError("找不到 MathType 的 MT6.dll：请确认已安装 MathType 7。")
+    text = re.sub(r"\\(?:label|tag)\{[^{}]*\}", "", text)
+    text = re.sub(r"\\(?:begin|end)\{(?:equation\*?|displaymath|math)\}", "", text).strip()
+
+    match = _ENV_RE.search(text)
+    if match is not None:
+        env = match.group("env")
+        if env in _MULTILINE_ENVS:
+            rows = _split_rows(match.group("body"))
+            joined = " \\\\ ".join(row.replace("&", "") for row in rows)
+            if brace_hint:
+                return r"\left\{\begin{array}{l}" + joined + r"\end{array}\right."
+            return r"\begin{array}{l}" + joined + r"\end{array}"
+        if env == "cases":
+            rows = _split_rows(match.group("body"))
+            # MathType's cases template is single-column; a second column is laid
+            # out with spacing instead of an alignment tab.
+            joined = " \\\\ ".join(row.replace("&", r"\quad ") if "&" in row else row for row in rows)
+            return r"\begin{cases}" + joined + r"\end{cases}"
+
+    if "\\\\" in text and "\\begin{" not in text:
+        rows = _split_rows(text)
+        joined = " \\\\ ".join(row.replace("&", "") for row in rows)
+        if brace_hint:
+            return r"\left\{\begin{array}{l}" + joined + r"\end{array}\right."
+        return r"\begin{array}{l}" + joined + r"\end{array}"
+    return text
 
 
-class MathTypeEngine:
-    """Keeps the MathType API connection warm for the lifetime of the sidecar."""
+def detect_left_brace(image_path: str) -> bool:
+    """True when the formula image starts with one tall curly brace.
 
-    def __init__(self) -> None:
-        self._dll = None
-        self._connected = False
-
-    def _load(self):
-        if self._dll is not None:
-            return self._dll
-        dll_path = find_mathtype_dll()
-        dll = ctypes.WinDLL(str(dll_path))
-        dll.MTAPIConnect.argtypes = [ctypes.c_int, ctypes.c_int]
-        dll.MTAPIConnect.restype = ctypes.c_int
-        dll.MTAPIDisconnect.argtypes = []
-        dll.MTAPIDisconnect.restype = ctypes.c_int
-        dll.MTXFormSetTranslator.argtypes = [ctypes.c_int, ctypes.c_char_p]
-        dll.MTXFormSetTranslator.restype = ctypes.c_int
-        dll.MTXFormEqn.argtypes = [
-            ctypes.c_int,  # source type
-            ctypes.c_int,  # source format
-            ctypes.c_void_p,  # source data
-            ctypes.c_int,  # source length
-            ctypes.c_int,  # destination type
-            ctypes.c_int,  # destination format
-            ctypes.c_void_p,  # destination data
-            ctypes.c_int,  # destination length
-            ctypes.c_char_p,  # translator name override
-            ctypes.c_void_p,  # reserved
-        ]
-        dll.MTXFormEqn.restype = ctypes.c_int
-        self._dll = dll
-        log("loaded MathType dll:", dll_path)
-        return dll
-
-    def connect(self):
-        dll = self._load()
-        if self._connected:
-            return dll
-        rc = int(dll.MTAPIConnect(0, 30))
-        if rc != 0:
-            raise RunError("连接 MathType API 失败 (MTAPIConnect rc=%d)" % rc)
-        rc = int(dll.MTXFormSetTranslator(TRANSLATOR_SLOT, LATEX_TRANSLATOR))
-        if rc != 0:
-            raise RunError("设置 MathType LaTeX 转换器失败 (rc=%d)" % rc)
-        self._connected = True
-        return dll
-
-    def latex_to_clipboard_object(self, latex: str) -> None:
-        """Convert LaTeX text into a MathType OLE object on the clipboard."""
-        payload = latex.encode("utf-8") + b"\x00"
-        for attempt in range(2):
-            dll = self.connect()
-            rc = int(
-                dll.MTXFormEqn(
-                    LOCAL_BUFFER_SOURCE,
-                    FORMAT_TEXT,
-                    ctypes.c_char_p(payload),
-                    len(payload),
-                    CLIPBOARD_SOURCE,
-                    FORMAT_MATHTYPE_OLE,
-                    None,
-                    0,
-                    b"",
-                    None,
-                )
-            )
-            if rc == 0:
-                return
-            # A stale connection (MathType restarted) is the usual cause; retry once.
-            self.close()
-            if attempt == 1:
-                raise RunError("MathType 转换 LaTeX 失败 (MTXFormEqn rc=%d)" % rc)
-
-    def close(self) -> None:
-        if self._dll is not None and self._connected:
-            try:
-                self._dll.MTAPIDisconnect()
-            except Exception:
-                pass
-        self._connected = False
-
-
-# --------------------------------------------------------------------------
-# Word: paste the clipboard object at the caret and verify it landed
-# --------------------------------------------------------------------------
-
-def insert_into_active_word() -> int:
-    import pythoncom
-    import win32com.client
-
-    pythoncom.CoInitialize()
+    SimpleTex often describes a braced equation system as ``aligned`` and drops
+    the brace; this heuristic recovers it. A brace is a tall, narrow dark shape
+    whose column coverage is most of the formula height.
+    """
     try:
-        try:
-            word = win32com.client.GetActiveObject("Word.Application")
-        except Exception:
-            raise RunError(
-                "没有找到正在运行的 Word。请先打开要写入的报告文档，"
-                "把光标放到要插入公式的位置，再重新触发。"
-            ) from None
-        if int(word.Documents.Count) < 1:
-            raise RunError("Word 里没有打开的文档，请先打开报告文档并定位光标。")
-        doc = word.ActiveDocument
-        before = int(doc.InlineShapes.Count)
-        try:
-            word.Selection.Paste()
-        except Exception as exc:
-            raise RunError("粘贴到 Word 失败：%s" % exc) from exc
-        time.sleep(0.25)
-        after = int(doc.InlineShapes.Count)
-        if after <= before:
-            raise RunError(
-                "已在 Word 中执行粘贴，但文档里没有新增 MathType 对象；"
-                "请确认光标在正文中且 MathType 已安装。"
-            )
-        return after - before
-    finally:
-        try:
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
-
-
-def _set_clipboard_text(text: str) -> None:
+        import numpy as np
+        from PIL import Image
+    except ImportError:
+        return False
     try:
-        import win32clipboard
-        import win32con
-
-        win32clipboard.OpenClipboard()
-        try:
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
-        finally:
-            win32clipboard.CloseClipboard()
+        image = Image.open(image_path).convert("L")
+        array = np.asarray(image)
+        dark = array < 128
+        rows = np.where(dark.any(axis=1))[0]
+        cols = np.where(dark.any(axis=0))[0]
+        if rows.size == 0 or cols.size == 0:
+            return False
+        y0, y1, x0, x1 = int(rows[0]), int(rows[-1]), int(cols[0]), int(cols[-1])
+        height, width = y1 - y0 + 1, x1 - x0 + 1
+        if height < 20 or width < 20:
+            return False
+        left_width = max(2, int(width * 0.12))
+        region = dark[y0 : y1 + 1, x0 : x0 + left_width]
+        column_coverage = region.sum(axis=0)
+        return bool((column_coverage >= 0.55 * height).any())
     except Exception:
-        pass
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -329,19 +242,6 @@ def grab_clipboard_image() -> tuple[str, bool]:
     return tmp, True
 
 
-def _strip_latex_wrappers(latex: str) -> str:
-    text = latex.strip()
-    if len(text) >= 4 and (
-        (text.startswith("$$") and text.endswith("$$"))
-        or (text.startswith("\\(") and text.endswith("\\)"))
-        or (text.startswith("\\[") and text.endswith("\\]"))
-    ):
-        return text[2:-2].strip()
-    if len(text) >= 2 and text.startswith("$") and text.endswith("$"):
-        return text[1:-1].strip()
-    return text
-
-
 def _mime_for(path: str) -> str:
     return MIME_BY_SUFFIX.get(Path(path).suffix.lower(), "image/png")
 
@@ -364,7 +264,7 @@ def _extract_latex(data: dict) -> tuple[str, float | None]:
         conf = float(conf) if conf is not None else None
     except (TypeError, ValueError):
         conf = None
-    return _strip_latex_wrappers(latex), conf
+    return latex, conf
 
 
 def recognize(image_path: str, token: str, model: str) -> tuple[str, float | None]:
@@ -388,10 +288,112 @@ def recognize(image_path: str, token: str, model: str) -> tuple[str, float | Non
 
 
 # --------------------------------------------------------------------------
+# Insertion: build/run the C# OLE injector
+# --------------------------------------------------------------------------
+
+def find_csc() -> str:
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    candidates = [
+        Path(windir) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe",
+        Path(windir) / "Microsoft.NET" / "Framework" / "v4.0.30319" / "csc.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    raise RunError("找不到 .NET Framework 编译器 csc.exe，无法构建 MathType 注入器。")
+
+
+def ensure_injector() -> Path:
+    if INJECTOR_EXE.exists() and INJECTOR_EXE.stat().st_size > 0:
+        return INJECTOR_EXE
+    if not INJECTOR_SRC.exists():
+        raise RunError("找不到注入器源码：%s" % INJECTOR_SRC)
+    INJECTOR_DIR.mkdir(parents=True, exist_ok=True)
+    compiler = find_csc()
+    try:
+        proc = subprocess.run(
+            [compiler, "-nologo", "-target:exe", "-out:" + str(INJECTOR_EXE), str(INJECTOR_SRC)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        raise RunError("构建 MathType 注入器超时。") from None
+    if not INJECTOR_EXE.exists():
+        detail = ((proc.stdout or "") + (proc.stderr or "")).strip()[-800:]
+        raise RunError("构建 MathType 注入器失败：%s" % (detail or "csc 没有产生 exe"))
+    log("built injector:", INJECTOR_EXE)
+    return INJECTOR_EXE
+
+
+def inject_latex(latex: str) -> dict:
+    exe = ensure_injector()
+    fd, temp_name = tempfile.mkstemp(prefix="dsh-formula-", suffix=".tex")
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        temp_path.write_text(latex, encoding="utf-8")
+        try:
+            proc = subprocess.run(
+                [str(exe), "--mode", "insert", "--file", str(temp_path), "--format", "tex"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=INJECTOR_TIMEOUT_SECONDS,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except subprocess.TimeoutExpired:
+            raise RunError("插入 Word 超时（%d 秒）。" % INJECTOR_TIMEOUT_SECONDS) from None
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    payload = None
+    for line in reversed([line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]):
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        break
+    if proc.returncode != 0 or not isinstance(payload, dict) or payload.get("ok") is not True:
+        detail = ""
+        if isinstance(payload, dict):
+            detail = str(payload.get("error") or "")
+        if not detail:
+            stderr_lines = [line for line in (proc.stderr or "").splitlines() if line.strip()]
+            detail = stderr_lines[-1] if stderr_lines else "未知错误"
+        raise RunError("插入 Word 失败：%s" % detail, latex=latex)
+    try:
+        width = float(payload.get("width") or 0)
+        height = float(payload.get("height") or 0)
+    except (TypeError, ValueError):
+        width = height = 0.0
+    return {"width": width, "height": height}
+
+
+def _set_clipboard_text(text: str) -> None:
+    try:
+        import win32clipboard
+        import win32con
+
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
 # Request handling
 # --------------------------------------------------------------------------
 
-def run_request(request: dict, engine: MathTypeEngine, *, token: str, model: str) -> dict:
+def run_request(request: dict, *, token: str, model: str) -> dict:
     started = time.time()
     mode = str(request.get("mode") or "").strip().lower()
     if not mode:
@@ -399,36 +401,33 @@ def run_request(request: dict, engine: MathTypeEngine, *, token: str, model: str
 
     cleanup_path: str | None = None
     try:
+        raw_latex: str
+        conf: float | None = None
+        brace: bool | None = None
+
         if mode == "latex":
-            latex = _strip_latex_wrappers(str(request.get("latex") or ""))
-            if not latex:
+            raw_latex = _strip_wrappers(str(request.get("latex") or ""))
+            if not raw_latex:
                 raise RunError("mode=latex 时必须提供 latex 文本。")
-            conf: float | None = None
-        elif mode == "image":
-            image_path = str(request.get("imagePath") or "").strip()
-            if not image_path:
-                raise RunError("mode=image 时必须提供 imagePath。")
-            if not Path(image_path).is_file():
-                raise RunError("找不到图片文件：%s" % image_path)
-            latex, conf = recognize(image_path, token, model)
-        elif mode == "clipboard":
-            image_path, should_remove = grab_clipboard_image()
-            cleanup_path = image_path if should_remove else None
-            latex, conf = recognize(image_path, token, model)
+            latex = normalize_latex(raw_latex)
+        elif mode in ("image", "clipboard"):
+            if mode == "image":
+                image_path = str(request.get("imagePath") or "").strip()
+                if not image_path:
+                    raise RunError("mode=image 时必须提供 imagePath。")
+                if not Path(image_path).is_file():
+                    raise RunError("找不到图片文件：%s" % image_path)
+            else:
+                image_path, should_remove = grab_clipboard_image()
+                cleanup_path = image_path if should_remove else None
+            raw_latex, conf = recognize(image_path, token, model)
+            brace = detect_left_brace(image_path)
+            latex = normalize_latex(raw_latex, brace_hint=brace)
         else:
             raise RunError("未知的 mode：%s" % mode)
 
         try:
-            engine.latex_to_clipboard_object(latex)
-        except Exception as exc:
-            raise RunError(
-                "%s\n(公式 LaTeX 已复制到系统剪贴板，可手动粘贴到 Word 后用 MathType 转换。)" % exc,
-                latex=latex,
-                conf=conf,
-            ) from exc
-
-        try:
-            inserted = insert_into_active_word()
+            inserted = inject_latex(latex)
         except Exception as exc:
             _set_clipboard_text(latex)
             raise RunError(
@@ -441,8 +440,11 @@ def run_request(request: dict, engine: MathTypeEngine, *, token: str, model: str
             "ok": True,
             "mode": mode,
             "latex": latex,
+            "raw_latex": raw_latex,
             "conf": conf,
-            "inserted": inserted,
+            "brace": brace,
+            "width": inserted["width"],
+            "height": inserted["height"],
             "elapsedMs": int((time.time() - started) * 1000),
             "message": "已插入 MathType 公式",
         }
@@ -462,12 +464,15 @@ def serve(*, token_file: str, model: str) -> int:
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-    engine = MathTypeEngine()
     token = ""
     try:
         token = read_token(token_file)
     except Exception as exc:
         log("token unavailable:", exc)
+    try:
+        ensure_injector()
+    except Exception as exc:
+        log("injector not ready:", exc)
     log("sidecar ready (model=%s, token=%s)" % (model, "loaded" if token else "MISSING"))
 
     try:
@@ -489,10 +494,10 @@ def serve(*, token_file: str, model: str) -> int:
                 respond(id=request_id, ok=True, message="bye")
                 break
             if action == "warmup":
-                # Pay MathType engine start-up now instead of on the first formula.
+                # Build the injector now so the first formula is not delayed.
                 try:
-                    engine.connect()
-                    respond(id=request_id, ok=True, message="warm")
+                    path = ensure_injector()
+                    respond(id=request_id, ok=True, message="warm", injector=str(path))
                 except Exception as exc:
                     log("warmup failed:", exc)
                     respond(id=request_id, ok=False, error=str(exc))
@@ -500,7 +505,7 @@ def serve(*, token_file: str, model: str) -> int:
             try:
                 if not token:
                     token = read_token(token_file)
-                response = run_request(request, engine, token=token, model=model)
+                response = run_request(request, token=token, model=model)
                 response["id"] = request_id
                 respond(**response)
             except RunError as exc:
@@ -515,7 +520,6 @@ def serve(*, token_file: str, model: str) -> int:
                 log("request crashed:", exc)
                 respond(id=request_id, ok=False, error="内部错误：%s" % exc)
     finally:
-        engine.close()
         log("sidecar exiting")
     return 0
 
@@ -531,14 +535,14 @@ def main(argv: list[str] | None = None) -> int:
 
     serve_parser = sub.add_parser("serve", help="run the JSON-lines sidecar")
     serve_parser.add_argument("--token-file", default="")
-    serve_parser.add_argument("--model", default="turbo", choices=["turbo", "standard"])
+    serve_parser.add_argument("--model", default="standard", choices=["turbo", "standard"])
 
     run_parser = sub.add_parser("run", help="one-shot run, for manual testing")
     run_parser.add_argument("--mode", default="clipboard", choices=["clipboard", "latex", "image"])
     run_parser.add_argument("--latex", default="")
     run_parser.add_argument("--image-path", default="")
     run_parser.add_argument("--token-file", default="")
-    run_parser.add_argument("--model", default="turbo", choices=["turbo", "standard"])
+    run_parser.add_argument("--model", default="standard", choices=["turbo", "standard"])
 
     args = parser.parse_args(argv)
     if args.command == "serve":
@@ -549,17 +553,14 @@ def main(argv: list[str] | None = None) -> int:
         request["latex"] = args.latex
     if args.image_path:
         request["imagePath"] = args.image_path
-    engine = MathTypeEngine()
     try:
         token = read_token(args.token_file)
-        result = run_request(request, engine, token=token, model=args.model)
+        result = run_request(request, token=token, model=args.model)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
         return 1
-    finally:
-        engine.close()
 
 
 if __name__ == "__main__":

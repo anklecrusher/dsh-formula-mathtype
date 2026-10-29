@@ -1,19 +1,20 @@
 # Registers the formula-mathtype host plugin.
 #
 # One formula pipeline:
-#   clipboard screenshot -> SimpleTex formula OCR -> LaTeX -> MT6.dll
-#   (MathType SDK) -> MathType OLE object on the clipboard -> Word COM paste
-#   at the caret of the active Word document.
+#   clipboard screenshot -> SimpleTex formula OCR -> LaTeX (normalized)
+#   -> injector/MathTypeInjector.exe -> real MathType OLE object (Equation.DSMT4)
+#   inserted at the caret of the active Word document.
 #
 # Requirements on this machine: MathType 7 installed (Equation.DSMT4 registered),
-# Microsoft Word desktop, and a Python with requests + Pillow + pywin32.
+# Microsoft Word desktop, Python with requests + Pillow + numpy, and the .NET
+# Framework compiler (csc.exe, ships with Windows) used to build the injector.
 - insert:
     - id: formula-mathtype
       name: '@local/dsh-formula-mathtype'
       config:
-        # Python interpreter that has pywin32, Pillow and requests installed.
+        # Python interpreter that has requests, Pillow and numpy installed.
         pythonPath: 'D:/Program Files/python.exe'
         # One-line SimpleTex user access token (UAT). Kept outside the repo.
         tokenFile: 'C:/Users/ankle crusher/AppData/Local/dsh-formula-mathtype/simpletex.token'
-        # turbo = 轻量模型（0.04 元/次）；standard = 标准模型（0.05 元/次）
-        model: turbo
+        # standard = 标准模型（0.05 元/次，复杂多行方程组明显更准）；turbo = 轻量模型（0.04 元/次）
+        model: standard

@@ -9,10 +9,12 @@
  *
  *   1. the sidecar reads the formula image from the Windows clipboard,
  *   2. posts it to the SimpleTex formula OCR open API and takes `res.latex`,
- *   3. feeds that LaTeX to MathType's own SDK interface in `MT6.dll`
- *      (`MTAPIConnect` / `MTXFormSetTranslator` / `MTXFormEqn`), which puts a
- *      real MathType OLE object (`Equation.DSMT4`) on the clipboard,
- *   4. pastes it at the caret of the active Word document through Word COM.
+ *   3. normalizes the LaTeX for MathType's parser (aligned -> array, brace
+ *      restoration for equation systems) and hands it to the bundled
+ *      `injector/MathTypeInjector.exe`,
+ *   4. the injector creates a real MathType OLE object (`Equation.DSMT4`) at the
+ *      caret through Word COM and feeds its equation server the
+ *      `TeX Input Language` clipboard format.
  *
  * No MathType window opens, no Word macro runs, and the result is an editable
  * MathType equation object rather than an image or Word-native OMML.
@@ -350,6 +352,7 @@ function createTool(sidecar) {
     description:
       '把公式截图识别成 LaTeX，并作为真正的 MathType 公式插入当前打开的 Word 文档光标处。'
       + '默认从 Windows 剪贴板读取截图（用户先用 Win+Shift+S 或截图工具截取公式）。'
+      + '支持单行公式和多行方程组（截图里的大括号会自动还原）。'
       + '也可以传 latex 直接插入指定公式，或传 imagePath 指定图片文件。'
       + '只用于数学公式，不要用它插入普通文字。返回识别出的 LaTeX、置信度和耗时。',
     parameters: {
@@ -461,7 +464,7 @@ function resolveOptions(config) {
     typeof config?.tokenFile === 'string' && config.tokenFile.trim().length > 0
       ? config.tokenFile.trim()
       : DEFAULT_TOKEN_FILE
-  const model = config?.model === 'standard' ? 'standard' : 'turbo'
+  const model = config?.model === 'turbo' ? 'turbo' : 'standard'
   return { pythonPath, helperPath, tokenFile, model }
 }
 
@@ -481,7 +484,7 @@ export function apply(ctx, config) {
   ctx.tools.register(createTool(sidecar))
   ctx.commands.register(createCommand(sidecar))
 
-  // Warm the sidecar (Python + MathType engine) without blocking activation.
+  // Warm the sidecar (Python + build the C# injector) without blocking activation.
   // Word is intentionally not touched: it only exists when the user has it open.
   sidecar.request({ action: 'warmup' }, WARMUP_TIMEOUT_MS).catch(() => {})
 }
