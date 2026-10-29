@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """Windows sidecar for @local/dsh-formula-mathtype.
 
-One request inserts one formula into the *active* Word document:
+One request inserts one formula into the *active* Word document or the active
+PowerPoint slide (``target`` = ``word`` / ``ppt``):
 
 1. read the formula image from the Windows clipboard (or a file path),
 2. POST it to the SimpleTex formula-recognition open API and take ``res.latex``,
@@ -305,7 +306,13 @@ def find_csc() -> str:
 
 def ensure_injector() -> Path:
     if INJECTOR_EXE.exists() and INJECTOR_EXE.stat().st_size > 0:
-        return INJECTOR_EXE
+        try:
+            # Rebuild when the C# source changed (the exe is gitignored, so an
+            # older checkout may leave a stale binary behind).
+            if not INJECTOR_SRC.exists() or INJECTOR_EXE.stat().st_mtime >= INJECTOR_SRC.stat().st_mtime:
+                return INJECTOR_EXE
+        except OSError:
+            return INJECTOR_EXE
     if not INJECTOR_SRC.exists():
         raise RunError("找不到注入器源码：%s" % INJECTOR_SRC)
     INJECTOR_DIR.mkdir(parents=True, exist_ok=True)
@@ -329,8 +336,19 @@ def ensure_injector() -> Path:
     return INJECTOR_EXE
 
 
-def inject_latex(latex: str) -> dict:
+TARGET_LABELS = {"word": "Word", "ppt": "PowerPoint"}
+
+
+def _target_label(target: str) -> str:
+    return TARGET_LABELS.get(target, target)
+
+
+def inject_latex(latex: str, target: str = "word") -> dict:
     exe = ensure_injector()
+    target = (target or "word").strip().lower()
+    if target not in TARGET_LABELS:
+        raise RunError("未知的 target：%s" % target)
+    label = _target_label(target)
     fd, temp_name = tempfile.mkstemp(prefix="dsh-formula-", suffix=".tex")
     os.close(fd)
     temp_path = Path(temp_name)
@@ -338,7 +356,7 @@ def inject_latex(latex: str) -> dict:
         temp_path.write_text(latex, encoding="utf-8")
         try:
             proc = subprocess.run(
-                [str(exe), "--mode", "insert", "--file", str(temp_path), "--format", "tex"],
+                [str(exe), "--mode", "insert", "--target", target, "--file", str(temp_path), "--format", "tex"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -347,7 +365,7 @@ def inject_latex(latex: str) -> dict:
                 creationflags=CREATE_NO_WINDOW,
             )
         except subprocess.TimeoutExpired:
-            raise RunError("插入 Word 超时（%d 秒）。" % INJECTOR_TIMEOUT_SECONDS) from None
+            raise RunError("插入 %s 超时（%d 秒）。" % (label, INJECTOR_TIMEOUT_SECONDS)) from None
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -365,13 +383,13 @@ def inject_latex(latex: str) -> dict:
         if not detail:
             stderr_lines = [line for line in (proc.stderr or "").splitlines() if line.strip()]
             detail = stderr_lines[-1] if stderr_lines else "未知错误"
-        raise RunError("插入 Word 失败：%s" % detail, latex=latex)
+        raise RunError("插入 %s 失败：%s" % (label, detail), latex=latex)
     try:
         width = float(payload.get("width") or 0)
         height = float(payload.get("height") or 0)
     except (TypeError, ValueError):
         width = height = 0.0
-    return {"width": width, "height": height}
+    return {"width": width, "height": height, "target": target}
 
 
 def _set_clipboard_text(text: str) -> None:
@@ -398,6 +416,10 @@ def run_request(request: dict, *, token: str, model: str) -> dict:
     mode = str(request.get("mode") or "").strip().lower()
     if not mode:
         mode = "latex" if request.get("latex") else "clipboard"
+    target = str(request.get("target") or "word").strip().lower()
+    if target not in TARGET_LABELS:
+        raise RunError("未知的插入目标：%s（只支持 word / ppt）" % target)
+    target_label = _target_label(target)
 
     cleanup_path: str | None = None
     try:
@@ -427,11 +449,11 @@ def run_request(request: dict, *, token: str, model: str) -> dict:
             raise RunError("未知的 mode：%s" % mode)
 
         try:
-            inserted = inject_latex(latex)
+            inserted = inject_latex(latex, target=target)
         except Exception as exc:
             _set_clipboard_text(latex)
             raise RunError(
-                "%s\n(公式 LaTeX 已复制到系统剪贴板，可手动粘贴到 Word 后用 MathType 转换。)" % exc,
+                "%s\n(公式 LaTeX 已复制到系统剪贴板，可手动粘贴到 %s 后用 MathType 转换。)" % (exc, target_label),
                 latex=latex,
                 conf=conf,
             ) from exc
@@ -439,6 +461,7 @@ def run_request(request: dict, *, token: str, model: str) -> dict:
         return {
             "ok": True,
             "mode": mode,
+            "target": target,
             "latex": latex,
             "raw_latex": raw_latex,
             "conf": conf,
@@ -446,7 +469,7 @@ def run_request(request: dict, *, token: str, model: str) -> dict:
             "width": inserted["width"],
             "height": inserted["height"],
             "elapsedMs": int((time.time() - started) * 1000),
-            "message": "已插入 MathType 公式",
+            "message": "已插入 MathType 公式（%s）" % target_label,
         }
     finally:
         if cleanup_path:
@@ -543,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--image-path", default="")
     run_parser.add_argument("--token-file", default="")
     run_parser.add_argument("--model", default="standard", choices=["turbo", "standard"])
+    run_parser.add_argument("--target", default="word", choices=["word", "ppt"])
 
     hotkey_parser = sub.add_parser("hotkey", help="run the global-hotkey companion (B mode)")
     hotkey_parser.add_argument("--hotkey", default="Ctrl+Alt+F")
@@ -572,7 +596,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
         )
 
-    request: dict = {"action": "run", "mode": args.mode}
+    request: dict = {"action": "run", "mode": args.mode, "target": args.target}
     if args.latex:
         request["latex"] = args.latex
     if args.image_path:

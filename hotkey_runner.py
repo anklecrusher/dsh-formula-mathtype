@@ -472,6 +472,7 @@ class HotkeyApp:
         self._hook_proc_ref = None
         self._latched = False
         self._needs_esc = False
+        self.target = "word"
 
     def _post_update(self) -> None:
         try:
@@ -616,6 +617,15 @@ class HotkeyApp:
             pass
         return _user32.CallNextHookEx(self.hook or 0, n_code, w_param, l_param)
 
+    def _foreground_target(self) -> str | None:
+        """Word/PowerPoint if the foreground window belongs to them."""
+        name = _foreground_process_name()
+        if name == "winword.exe":
+            return "word"
+        if name in ("powerpnt.exe", "powerpnt"):
+            return "ppt"
+        return None
+
     def _dismiss_word_keytips(self) -> None:
         """Alt-based combos put Word into keytip mode; Esc clears it."""
         if not self._needs_esc:
@@ -642,13 +652,20 @@ class HotkeyApp:
     # -- events ------------------------------------------------------------
 
     def _on_press(self) -> None:
+        target = self._foreground_target()
+        if target is None:
+            _append_log("hotkey ignored: foreground is neither Word nor PowerPoint")
+            if self.toast is not None:
+                self.toast.show("请先切到 Word 或 PowerPoint，再按热键", error=True, ttl_ms=2600)
+            return
         if self.busy:
             _append_log("hotkey pressed while busy; ignored")
             if self.toast is not None:
                 self.toast.show("正在处理上一条公式，请稍候…", ttl_ms=1400)
             return
         self.busy = True
-        _append_log("hotkey pressed")
+        self.target = target
+        _append_log("hotkey pressed (target=%s)" % target)
         self._schedule_menu_dismiss()
         if self.toast is not None:
             self.toast.show("正在识别公式…", ttl_ms=0)
@@ -660,7 +677,11 @@ class HotkeyApp:
         try:
             if not self.token:
                 self.token = helper.read_token(self.token_file)
-            result = helper.run_request({"action": "run", "mode": "clipboard"}, token=self.token, model=self.model)
+            result = helper.run_request(
+                {"action": "run", "mode": "clipboard", "target": self.target},
+                token=self.token,
+                model=self.model,
+            )
             self.events.put(("result", result))
         except Exception as exc:
             self.events.put(("error", str(exc)))
@@ -677,7 +698,8 @@ class HotkeyApp:
             if kind == "result":
                 latex = str(payload.get("latex") or "")
                 conf = payload.get("conf")
-                title = "✓ 已插入 MathType 公式"
+                label = "PPT" if self.target == "ppt" else "Word"
+                title = "✓ 已插入 MathType 公式（%s）" % label
                 if isinstance(conf, (int, float)):
                     title += "（conf %.2f）" % float(conf)
                 preview = latex if len(latex) <= 150 else latex[:147] + "…"

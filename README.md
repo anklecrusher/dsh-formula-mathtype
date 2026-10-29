@@ -1,8 +1,8 @@
 # dsh-formula-mathtype
 
-DSH 插件：**截图公式 → SimpleTex 识别 → 真正的 MathType 公式 → 插入当前 Word 文档光标处**。
+DSH 插件：**截图公式 → SimpleTex 识别 → 真正的 MathType 公式 → 插入当前 Word 文档 / PowerPoint 幻灯片**。
 
-面向论文写作场景：用 `Win+Shift+S` 截下论文里的公式，敲一次 `/formula`，Word 里就多一个可编辑的 MathType 公式对象（`Equation.DSMT4`），不是图片、不是 Word 原生公式。
+面向论文与汇报场景：用 `Win+Shift+S` 截下论文里的公式，敲一次 `/formula`（或按全局热键），Word 里就多一个可编辑的 MathType 公式对象（`Equation.DSMT4`）；在 PowerPoint 里则插入到当前幻灯片（v0.4.0 起）。都不是图片、不是 Office 原生公式。
 
 ## 工作流
 
@@ -18,12 +18,13 @@ LaTeX 归一化（helper.py）
    从原图检测大括号 → \left\{\begin{array}{l}...\end{array}\right.
    │
    ▼
-injector/MathTypeInjector.exe（Word COM + MathType OLE）
-   InlineShapes.AddOLEObject("Equation.DSMT4") → OLEFormat.DoVerb
+injector/MathTypeInjector.exe（Word / PowerPoint COM + MathType OLE）
+   Word:        InlineShapes.AddOLEObject("Equation.DSMT4") → OLEFormat.DoVerb
+   PowerPoint:  Shapes.AddOLEObject(..., "Equation.DSMT4", ...) → OLEFormat.DoVerb
    → IDataObject.SetData("TeX Input Language", LaTeX) → IOleObject.Close
    │
    ▼
-活动文档光标处：可编辑的 MathType 公式
+Word 光标处 / PPT 当前幻灯片：可编辑的 MathType 公式
 ```
 
 不弹 MathType 窗口、不运行 Word 宏、不依赖 Office PIA。注入器是 C# 源码，首次使用由 `helper.py` 调 Windows 自带的 `.NET Framework` 编译器（`csc.exe`）自动构建。
@@ -34,7 +35,9 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 | --- | --- |
 | 单行简单公式（截图→OCR→插入） | 约 2.5 秒 |
 | 6 行大括号方程组（standard 模型） | OCR 约 10 秒 + 插入约 2.7 秒 |
-| B 模式按热键到插入（简单公式） | 约 1.2–2.5 秒 |
+| B 模式按热键到插入（简单公式，Word） | 约 1.2–2.5 秒 |
+| PowerPoint 插入（含 OCR 的简单公式） | 约 3–5 秒 |
+| PowerPoint 插入纯 LaTeX（无 OCR） | 约 1 秒 |
 
 耗时主要在 SimpleTex 标准模型的网络识别上；插入本身（OLE 对象创建 + TeX 解析 + 保存）对简单公式约 0.4–0.7 秒、对 6 行方程组约 2.7 秒。
 
@@ -52,7 +55,7 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 | `entry.js` | cache-busting 入口，静态声明 `inject = ['tools','commands']` |
 | `index.js` | DSH 宿主插件：注册 `/formula` 命令与 `formula_insert` 工具，管理常驻 Python sidecar |
 | `helper.py` | Python sidecar：剪贴板取图 / SimpleTex OCR / LaTeX 归一化 / 大括号检测 / 调注入器 |
-| `injector/MathTypeInjector.cs` | Word COM + MathType OLE 注入器源码（首次使用自动编译） |
+| `injector/MathTypeInjector.cs` | Word / PowerPoint COM + MathType OLE 注入器源码（首次使用自动编译） |
 | `hotkey_runner.py` | B 模式常驻助手：全局热键 + 原生 Win32 toast + 复用插入逻辑 |
 | `cordis.patch.yml` | 插件行与默认配置 |
 | `test-harness.mjs` | 不依赖 DSH 的离线自测 |
@@ -61,7 +64,7 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 
 - Windows（剪贴板、Word COM、MathType OLE）
 - MathType 7（注册了 `Equation.DSMT4` 的 OLE 服务器即可，不需要 SDK）
-- Microsoft Word 桌面版
+- Microsoft Word 桌面版（`target=word`）和/或 Microsoft PowerPoint 桌面版（`target=ppt`）
 - .NET Framework 4.x（Windows 自带 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`，用于首次构建注入器）
 - Python 3.10+，装有 `requests`、`Pillow`、`numpy`（`pywin32` 只在失败回退时用于把 LaTeX 复制到剪贴板，可选）
 - B 模式的热键提示用原生 Win32 分层窗口绘制，**不需要 Tcl/Tk**（本机 Python 的 Tcl 数据不完整，Tkinter 不可用也能工作）
@@ -98,21 +101,24 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 ## 用法
 
 - 截图后（图在剪贴板里），在 DSH 里输入 `/formula` 回车 → 插入当前 Word 文档光标处。
+- 想插到 PPT：`/formula ppt`（读剪贴板截图）或 `/formula ppt \frac{a}{b}`（直接给 LaTeX）。
 - 也可以直接给 LaTeX：`/formula \frac{a}{b}=\sqrt{x^{2}+y^{2}}`。
-- 自然语言也可以：让模型调用 `formula_insert` 工具（参数 `mode: clipboard|latex|image`）。
+- 自然语言也可以：让模型调用 `formula_insert` 工具（参数 `mode: clipboard|latex|image`，`target: word|ppt`）。
 
-建议流程：先在 Word 里把光标放到目标段落，再回 DSH 触发；识别结果、置信度和耗时会在会话里显示。多行方程组会自动还原大括号。
+建议流程：先在 Word 里把光标放到目标段落（PPT 里切到目标幻灯片），再回 DSH 触发；识别结果、置信度和耗时会在会话里显示。多行方程组会自动还原大括号。
+
+PowerPoint 的插入位置：当前幻灯片居中；如果先选中了一个形状/文本框（或正在编辑文本），则插到它的下方。插入的是浮动 OLE 对象，可以随意拖动、缩放；PPT 文本里不能像 Word 那样内联（后续可加）。
 
 ## B 模式：全局热键（v0.3.0）
 
 插件加载后会常驻一个热键小助手（`helper.py hotkey`），注册系统级热键（默认 `Ctrl+Alt+F`）。使用流程：
 
 1. `Win+Shift+S` 截公式（图进剪贴板）；
-2. **保持在 Word 里**，直接按 `Ctrl+Alt+F`；
+2. **保持在 Word 或 PowerPoint 里**，直接按 `Ctrl+Alt+F`（前台是哪个程序就插到哪个）；
 3. 右上角弹出小提示「正在识别公式…」，完成后变成「✓ 已插入 MathType 公式」并显示 LaTeX 预览，2.6 秒后自动消失；
 4. 失败时显示红色错误提示（8 秒），详情写入 `%LOCALAPPDATA%\dsh-formula-mathtype\hotkey.log`。
 
-实测：简单公式从按键到插入约 **1.2–2.5 秒**，6 行方程组约 10 秒（主要是标准模型识别时间）。提示窗口是无激活（`WS_EX_NOACTIVATE`）的原生 Win32 分层窗口，不会抢 Word 焦点；本机 Python 的 Tcl/Tk 数据不完整，所以没有用 Tkinter。
+实测：Word 里简单公式从按键到插入约 **1.2–2.5 秒**，PPT 里约 **3–5 秒**（多了 PowerPoint OLE 激活开销，主要仍是标准模型识别时间）；6 行方程组约 10 秒。前台既不是 Word 也不是 PowerPoint 时会弹红色提示「请先切到 Word 或 PowerPoint」，不会误插。提示窗口是无激活（`WS_EX_NOACTIVATE`）的原生 Win32 分层窗口，不会抢焦点；本机 Python 的 Tcl/Tk 数据不完整，所以没有用 Tkinter。
 
 热键用低级键盘钩子（`WH_KEYBOARD_LL`）实现：按下 `Ctrl+Alt+F` 时组合键会被吞掉，**不会触发 Word 自带的「插入脚注」**（Word 里 `Ctrl+Alt+F` 正是插入脚注快捷键，已实测确认）。因为组合键不含单独的 Alt，不会触发 Word 的键位提示。
 
@@ -161,6 +167,9 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 | `找不到 SimpleTex 令牌文件` | 把 UAT 写进 `tokenFile` 指向的文件 |
 | `剪贴板里没有图片` | 先截图（Win+Shift+S / QQ / 微信截图），确认图在剪贴板 |
 | `没有找到正在运行的 Word` | 先打开报告文档，把光标放到插入位置 |
+| `没有找到正在运行的 PowerPoint` | 先打开要写入的 .pptx，切到目标幻灯片 |
+| `PowerPoint 里没有打开的演示文稿` | 新建或打开一个演示文稿 |
+| `请把 PowerPoint 切回普通视图` | PPT 停在幻灯片浏览/阅读视图时无法定位当前页，切回普通视图 |
 | `Word 里没有打开的文档` | 先打开/新建文档 |
 | `构建 MathType 注入器失败` | 确认 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` 存在；删除 `injector/MathTypeInjector.exe` 后重试 |
 | `SimpleTex 识别失败` | 检查令牌、余额、QPS；整页文档图会返回 `[DOCIMG]`，请只截公式区域 |
@@ -174,7 +183,8 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 
 - 只有 Windows 可用。
 - 公式插在**光标处**，是行内对象；独立公式的居中、编号请沿用你现有的 Word/MathType 排版习惯。
-- 依赖桌面 Word（Word 未打开时无法插入；不会替你新建文档）。
+- 依赖桌面 Word / PowerPoint（未打开时无法插入；不会替你新建文档）。
+- PPT 里插入的是**浮动 OLE 对象**，不能像 Word 那样内联进文字段落；位置默认居中，可拖动调整。
 - 多行方程组识别约 10 秒（标准模型网络耗时）。
 - A 版（`/formula` 命令）与 B 版（全局热键）都已可用；B 版会常驻一个 Python 热键进程（约 30–40 MB 内存），配置 `hotkey: ''` 可关闭。
 

@@ -476,6 +476,19 @@ function resolveMode(args) {
 }
 
 /**
+ * Pick the insertion target app.
+ * @param {Record<string, any>} args
+ * @returns {'word'|'ppt'}
+ */
+function resolveTarget(args) {
+  const raw = typeof args?.target === 'string' ? args.target.trim().toLowerCase() : ''
+  if (raw === '') return 'word'
+  if (raw === 'word') return 'word'
+  if (raw === 'ppt' || raw === 'powerpoint') return 'ppt'
+  throw new Error(`未知 target "${args.target}"：只支持 word / ppt`)
+}
+
+/**
  * Validate arguments before touching the sidecar, so obvious mistakes fail fast.
  * @param {'clipboard'|'latex'|'image'} mode
  * @param {Record<string, any>} args
@@ -497,7 +510,8 @@ function validateArgs(mode, args) {
 function describeResult(result) {
   const conf = typeof result.conf === 'number' ? result.conf.toFixed(3) : 'n/a'
   const elapsed = typeof result.elapsedMs === 'number' ? result.elapsedMs : 0
-  return `已插入 MathType 公式（${elapsed} ms，置信度 ${conf}）：\n${result.latex ?? ''}`
+  const label = result.target === 'ppt' ? 'PowerPoint' : 'Word'
+  return `已插入 MathType 公式到 ${label}（${elapsed} ms，置信度 ${conf}）：\n${result.latex ?? ''}`
 }
 
 /**
@@ -508,7 +522,7 @@ function createTool(sidecar) {
   return {
     name: 'formula_insert',
     description:
-      '把公式截图识别成 LaTeX，并作为真正的 MathType 公式插入当前打开的 Word 文档光标处。'
+      '把公式截图识别成 LaTeX，并作为真正的 MathType 公式插入当前打开的 Word 文档光标处或 PowerPoint 当前幻灯片。'
       + '默认从 Windows 剪贴板读取截图（用户先用 Win+Shift+S 或截图工具截取公式）。'
       + '支持单行公式和多行方程组（截图里的大括号会自动还原）。'
       + '也可以传 latex 直接插入指定公式，或传 imagePath 指定图片文件。'
@@ -528,6 +542,11 @@ function createTool(sidecar) {
           type: 'string',
           description: 'mode=image 时公式图片的绝对路径',
         },
+        target: {
+          type: 'string',
+          enum: ['word', 'ppt'],
+          description: '插入目标：word（默认，Word 文档光标处）或 ppt（PowerPoint 当前幻灯片）',
+        },
       },
       required: [],
       additionalProperties: false,
@@ -542,11 +561,12 @@ function createTool(sidecar) {
             oneOf: [{ type: 'number' }, { type: 'null' }],
             description: 'SimpleTex 识别置信度；mode=latex 时为 null',
           },
+          target: { type: 'string', enum: ['word', 'ppt'], description: '实际插入的目标程序' },
           inserted: { type: 'integer', description: '本次插入新增的 MathType OLE 对象数量' },
           elapsedMs: { type: 'integer', description: '总耗时（毫秒）' },
           message: { type: 'string', description: '结果说明' },
         },
-        required: ['ok', 'latex', 'conf', 'inserted', 'elapsedMs', 'message'],
+        required: ['ok', 'latex', 'conf', 'target', 'inserted', 'elapsedMs', 'message'],
         additionalProperties: false,
       },
       render(_args, value) {
@@ -556,9 +576,11 @@ function createTool(sidecar) {
     async execute(args) {
       const mode = resolveMode(args)
       validateArgs(mode, args)
+      const target = resolveTarget(args)
       const result = await sidecar.request({
         action: 'run',
         mode,
+        target,
         latex: args.latex,
         imagePath: args.imagePath,
       })
@@ -569,6 +591,7 @@ function createTool(sidecar) {
         ok: true,
         latex: typeof result.latex === 'string' ? result.latex : '',
         conf: typeof result.conf === 'number' ? result.conf : null,
+        target: result.target === 'ppt' ? 'ppt' : 'word',
         inserted: typeof result.inserted === 'number' ? result.inserted : 1,
         elapsedMs: typeof result.elapsedMs === 'number' ? result.elapsedMs : 0,
         message: typeof result.message === 'string' ? result.message : '已插入 MathType 公式',
@@ -585,10 +608,11 @@ function createCommand(sidecar, hotkey) {
   return {
     name: 'formula',
     description:
-      '识别剪贴板公式截图并以 MathType 公式插入当前 Word 文档；'
-      + '/formula <LaTeX> 直接插入；/formula hotkey [status|on|off|restart] 管理全局热键',
+      '识别剪贴板公式截图并以 MathType 公式插入当前 Word 文档或 PowerPoint 幻灯片；'
+      + '/formula ppt 插入到 PowerPoint；/formula <LaTeX> 直接插入；'
+      + '/formula hotkey [status|on|off|restart] 管理全局热键',
     input: {
-      hint: '[可选的 LaTeX 文本 | hotkey [status|on|off|restart]；省略则读取剪贴板截图]',
+      hint: '[ppt] [可选的 LaTeX 文本] | hotkey [status|on|off|restart]；省略则读取剪贴板截图',
     },
     async handler(invocation) {
       const raw = String(invocation?.rawInput ?? '').trim()
@@ -596,12 +620,21 @@ function createCommand(sidecar, hotkey) {
       if (hotkeyMatch !== null) {
         return handleHotkeyCommand(hotkey, hotkeyMatch[1] ?? '')
       }
-      const mode = raw.length > 0 ? 'latex' : 'clipboard'
+      // Optional leading "ppt" / "word" picks the target app.
+      let target = 'word'
+      let body = raw
+      const targetMatch = /^(word|ppt|powerpoint)(?:\s+(.*))?$/i.exec(raw)
+      if (targetMatch !== null) {
+        target = targetMatch[1].toLowerCase() === 'word' ? 'word' : 'ppt'
+        body = (targetMatch[2] ?? '').trim()
+      }
+      const mode = body.length > 0 ? 'latex' : 'clipboard'
       try {
         const result = await sidecar.request({
           action: 'run',
           mode,
-          latex: mode === 'latex' ? raw : undefined,
+          target,
+          latex: mode === 'latex' ? body : undefined,
         })
         if (result.ok !== true) {
           throw new Error(typeof result.error === 'string' ? result.error : '公式插入失败')

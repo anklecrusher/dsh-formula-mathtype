@@ -52,7 +52,8 @@ console.log('---')
 
 check('tool registered', registeredTool !== null, 'no tool')
 check('tool name', registeredTool?.name === 'formula_insert', String(registeredTool?.name))
-check('tool params', JSON.stringify(Object.keys(registeredTool?.parameters?.properties ?? {})) === '["mode","latex","imagePath"]', JSON.stringify(registeredTool?.parameters))
+check('tool params', JSON.stringify(Object.keys(registeredTool?.parameters?.properties ?? {})) === '["mode","latex","imagePath","target"]', JSON.stringify(registeredTool?.parameters))
+check('tool target enum', JSON.stringify(registeredTool?.parameters?.properties?.target?.enum) === '["word","ppt"]', JSON.stringify(registeredTool?.parameters?.properties?.target))
 check('command registered', registeredCommand !== null, 'no command')
 check('command name', registeredCommand?.name === 'formula', String(registeredCommand?.name))
 check('command has handler', typeof registeredCommand?.handler === 'function', typeof registeredCommand?.handler)
@@ -69,6 +70,7 @@ const expectReject = async (label, promise) => {
 await expectReject('mode=latex without latex rejected', registeredTool.execute({ mode: 'latex' }))
 await expectReject('mode=image without imagePath rejected', registeredTool.execute({ mode: 'image' }))
 await expectReject('unknown mode rejected', registeredTool.execute({ mode: 'clipboard2' }))
+await expectReject('unknown target rejected', registeredTool.execute({ mode: 'latex', latex: 'x', target: 'excel' }))
 
 // Real sidecar round trip: with no clipboard image (or no Word) this must come
 // back as a clean {kind:'error'} result, not a crash.
@@ -78,6 +80,13 @@ check('command error path is reported', commandResult?.kind === 'error', JSON.st
 if (commandResult?.kind === 'error') {
   console.log('  sidecar error text :', String(commandResult.text).split('\n')[0])
 }
+
+// PowerPoint routing: /formula ppt must reach the sidecar and come back with a
+// structured result (success if a slide is open and the clipboard has an image,
+// otherwise a clean error — never a crash).
+const pptResult = await registeredCommand.handler({ rawInput: 'ppt' })
+check('ppt command returns structured result', pptResult?.kind === 'success' || pptResult?.kind === 'error', JSON.stringify(pptResult))
+console.log('  ppt command text  :', String(pptResult?.text ?? '').split('\n')[0])
 
 // B mode: the hotkey companion starts after the sidecar warm-up. Give it a
 // moment, then verify the status subcommand wired into /formula.

@@ -33,6 +33,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text;
+using System.Globalization;
 using ComIDataObject = System.Runtime.InteropServices.ComTypes.IDataObject;
 
 namespace MathTypeInjector
@@ -186,18 +187,118 @@ namespace MathTypeInjector
                 shape.Height.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"}");
         }
 
+        private static object ActivePowerPoint()
+        {
+            try
+            {
+                return Marshal.GetActiveObject("PowerPoint.Application");
+            }
+            catch (COMException)
+            {
+                throw new InvalidOperationException(
+                    "没有找到正在运行的 PowerPoint。请先打开要写入的演示文稿，定位到目标幻灯片，再重新触发。");
+            }
+        }
+
+        private static void InjectOnSlide(object appObject, string formula, string formatName)
+        {
+            dynamic app = appObject;
+            dynamic presentation;
+            try { presentation = app.ActivePresentation; }
+            catch (COMException)
+            {
+                throw new InvalidOperationException("PowerPoint 里没有打开的演示文稿，请先新建或打开一个 PPT。");
+            }
+            dynamic slide;
+            try { slide = app.ActiveWindow.View.Slide; }
+            catch (COMException)
+            {
+                throw new InvalidOperationException("请把 PowerPoint 切回普通视图，并定位到要插入公式的幻灯片。");
+            }
+
+            double slideWidth = Convert.ToDouble(presentation.PageSetup.SlideWidth, CultureInfo.InvariantCulture);
+            double slideHeight = Convert.ToDouble(presentation.PageSetup.SlideHeight, CultureInfo.InvariantCulture);
+            double left = (slideWidth - 240.0) / 2.0;
+            double top = (slideHeight - 80.0) / 2.0;
+
+            // If a shape is selected, or text is being edited, put the equation just below it.
+            try
+            {
+                dynamic selection = app.ActiveWindow.Selection;
+                int selectionType = (int)selection.Type; // 2 = shapes, 3 = text
+                if (selectionType == 2 || selectionType == 3)
+                {
+                    try
+                    {
+                        dynamic shapeRange = selection.ShapeRange;
+                        if ((int)shapeRange.Count >= 1)
+                        {
+                            dynamic first = shapeRange.Item(1);
+                            left = (double)first.Left;
+                            top = (double)first.Top + (double)first.Height + 12.0;
+                        }
+                    }
+                    catch (COMException) { }
+                }
+            }
+            catch (COMException) { }
+
+            if (left < 0) left = 0;
+            if (top < 0) top = 0;
+            if (left > slideWidth - 120.0) left = Math.Max(0.0, slideWidth - 120.0);
+            if (top > slideHeight - 60.0) top = Math.Max(0.0, slideHeight - 60.0);
+
+            dynamic shape = slide.Shapes.AddOLEObject(left, top, 200.0, 60.0, "Equation.DSMT4", "", false, "", 0, false);
+            dynamic oleFormat = shape.OLEFormat;
+            oleFormat.DoVerb(2);
+            System.Threading.Thread.Sleep(120);
+            object raw = oleFormat.Object;
+            ComIDataObject dataObject = raw as ComIDataObject;
+            IOleObject oleObject = raw as IOleObject;
+            if (dataObject == null)
+                throw new InvalidOperationException("Equation.DSMT4 没有暴露 IDataObject，无法写入公式内容。");
+            SetUnicodeData(dataObject, formatName, formula);
+            if (oleObject != null)
+            {
+                int hr = oleObject.Close(OLECLOSE_SAVEIFDIRTY);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+            }
+            System.Threading.Thread.Sleep(120);
+
+            // PowerPoint resizes the shape to fit the equation after the data is set;
+            // keep the whole shape inside the slide.
+            double width = 0, height = 0;
+            try
+            {
+                width = Convert.ToDouble(shape.Width, CultureInfo.InvariantCulture);
+                height = Convert.ToDouble(shape.Height, CultureInfo.InvariantCulture);
+                if (left + width > slideWidth) left = Math.Max(0.0, slideWidth - width);
+                if (top + height > slideHeight) top = Math.Max(0.0, slideHeight - height);
+                shape.Left = left;
+                shape.Top = top;
+            }
+            catch (COMException) { }
+
+            Console.WriteLine(
+                "{\"ok\":true,\"target\":\"ppt\",\"width\":\"" +
+                width.ToString("0.###", CultureInfo.InvariantCulture) +
+                "\",\"height\":\"" + height.ToString("0.###", CultureInfo.InvariantCulture) + "\"}");
+        }
+
         private static int Main(string[] args)
         {
             try { Console.OutputEncoding = Encoding.UTF8; } catch { }
             try
             {
                 string mode = "insert";
+                string target = "word";
                 string file = null, output = null, format = "tex";
                 for (int i = 0; i < args.Length; i++)
                 {
                     switch (args[i])
                     {
                         case "--mode": mode = args[++i]; break;
+                        case "--target": target = args[++i].ToLowerInvariant(); break;
                         case "--file": file = args[++i]; break;
                         case "--output": output = args[++i]; break;
                         case "--format": format = args[++i]; break;
@@ -205,6 +306,8 @@ namespace MathTypeInjector
                             throw new ArgumentException("未知参数：" + args[i]);
                     }
                 }
+                if (target != "word" && target != "ppt")
+                    throw new ArgumentException("--target 只能是 word 或 ppt");
                 if (file == null) throw new ArgumentException("缺少 --file 参数");
                 string formula = File.ReadAllText(file, Encoding.UTF8);
                 if (formula.Trim().Length == 0) throw new ArgumentException("公式文件为空");
@@ -212,6 +315,12 @@ namespace MathTypeInjector
 
                 if (mode == "insert")
                 {
+                    if (target == "ppt")
+                    {
+                        object ppt = ActivePowerPoint();
+                        InjectOnSlide(ppt, formula, formatName);
+                        return 0;
+                    }
                     dynamic app = ActiveWord();
                     dynamic docs = app.Documents;
                     if (docs.Count < 1)
