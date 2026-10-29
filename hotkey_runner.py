@@ -703,7 +703,12 @@ class HotkeyApp:
                 if isinstance(conf, (int, float)):
                     title += "（conf %.2f）" % float(conf)
                 preview = latex if len(latex) <= 150 else latex[:147] + "…"
-                _append_log("inserted: " + latex[:300])
+                # Deliberately do not log the formula text: hotkey.log may be shared
+                # in bug reports. Length + confidence are enough for diagnostics.
+                _append_log(
+                    "inserted (target=%s, chars=%d, conf=%s)"
+                    % (self.target, len(latex), conf if isinstance(conf, (int, float)) else "n/a")
+                )
                 if self.toast is not None:
                     self.toast.show(title + ("\n" + preview if preview else ""), ttl_ms=2600)
             else:

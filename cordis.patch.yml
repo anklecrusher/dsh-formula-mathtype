@@ -13,10 +13,14 @@
     - id: formula-mathtype
       name: '@local/dsh-formula-mathtype'
       config:
-        # Python interpreter that has requests, Pillow and numpy installed.
-        pythonPath: 'D:/Program Files/python.exe'
-        # One-line SimpleTex user access token (UAT). Kept outside the repo.
-        tokenFile: 'C:/Users/ankle crusher/AppData/Local/dsh-formula-mathtype/simpletex.token'
+        # Leave these empty to use the portable defaults (recommended, especially
+        # when the repository is cloned onto another machine):
+        #   pythonPath: auto-detect (env DSH_FORMULA_PYTHON/PYTHON, common install
+        #               dirs, then this repo author's D:/Program Files/python.exe)
+        #   tokenFile:  %LOCALAPPDATA%\dsh-formula-mathtype\simpletex.token
+        # Uncomment and set only if auto-detection does not find your interpreter.
+        pythonPath: ''
+        tokenFile: ''
         # standard = 标准模型（0.05 元/次，复杂多行方程组明显更准）；turbo = 轻量模型（0.04 元/次）
         model: standard
         # B 模式：全局热键。截图后不用切回 DSH，直接按这个键就把公式插进 Word。

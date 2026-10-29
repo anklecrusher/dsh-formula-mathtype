@@ -139,13 +139,24 @@ def _split_rows(body: str) -> list[str]:
     return [row.strip() for row in re.split(r"\\\\", body) if row.strip()]
 
 
-def normalize_latex(latex: str, *, brace_hint: bool | None = None) -> str:
+def _delimiter_hint(hint) -> str | None:
+    if hint is True:
+        return "brace"
+    if hint in (False, None):
+        return None
+    if isinstance(hint, str) and hint in ("brace", "bracket"):
+        return hint
+    return None
+
+
+def normalize_latex(latex: str, *, brace_hint: bool | str | None = None) -> str:
     """Rewrite LaTeX into constructs MathType's "TeX Input Language" accepts.
 
     Verified against MathType 7: ``array``/``matrix``/``cases``/``\\left\\{...\\right.``
     are understood, while ``aligned``/``align``/``split``/``gathered`` are not and
     would render as red error glyphs.
     """
+    delimiter = _delimiter_hint(brace_hint)
     text = _strip_wrappers(latex)
     text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(
@@ -161,8 +172,10 @@ def normalize_latex(latex: str, *, brace_hint: bool | None = None) -> str:
         if env in _MULTILINE_ENVS:
             rows = _split_rows(match.group("body"))
             joined = " \\\\ ".join(row.replace("&", "") for row in rows)
-            if brace_hint:
+            if delimiter == "brace":
                 converted = r"\left\{\begin{array}{l}" + joined + r"\end{array}\right."
+            elif delimiter == "bracket":
+                converted = r"\left[\begin{array}{l}" + joined + r"\end{array}\right]"
             else:
                 converted = r"\begin{array}{l}" + joined + r"\end{array}"
         elif env == "cases":
@@ -179,55 +192,114 @@ def normalize_latex(latex: str, *, brace_hint: bool | None = None) -> str:
     if "\\\\" in text and "\\begin{" not in text:
         rows = _split_rows(text)
         joined = " \\\\ ".join(row.replace("&", "") for row in rows)
-        if brace_hint:
+        if delimiter == "brace":
             return r"\left\{\begin{array}{l}" + joined + r"\end{array}\right."
+        if delimiter == "bracket":
+            return r"\left[\begin{array}{l}" + joined + r"\end{array}\right]"
         return r"\begin{array}{l}" + joined + r"\end{array}"
     return text
 
 
-def detect_left_brace(image_path: str) -> bool:
-    """True when the formula image starts with one tall curly brace.
+def _finite_median(values) -> float:
+    import numpy as np
 
-    SimpleTex often describes a braced equation system as ``aligned`` and drops
-    the brace; this heuristic recovers it. A brace is a tall, narrow dark shape
-    whose column coverage is most of the formula height.
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    return float(np.median(array)) if array.size else float("nan")
+
+
+def _finite_max(values) -> float:
+    import numpy as np
+
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    return float(np.max(array)) if array.size else float("nan")
+
+
+def detect_left_delimiter(image_path: str) -> str | None:
+    r"""Classify the tall left delimiter of a formula image.
+
+    Returns ``"brace"`` for ``{``, ``"bracket"`` for ``[``, or ``None`` when the
+    image has no such delimiter (plain formula, absolute-value bars, a vertical
+    table border, ...). SimpleTex often describes ``\begin{aligned}`` systems and
+    drops the outer brace, so this is used to restore ``\left\{...\right.`` (or
+    ``\left[...\right]``) when the source image actually has one.
+
+    The detector looks at the first ink column of every row in the leftmost 15%
+    of the ink bounding box. A curly brace is thin, spans nearly the whole height,
+    and its left edge moves right at the top/bottom hooks and left at the middle
+    cusp. A square bracket is a straight stroke with longer horizontal serifs at
+    the top and bottom. Both tests reject straight vertical bars.
     """
     try:
         import numpy as np
         from PIL import Image
     except ImportError:
-        return False
+        return None
     try:
         image = Image.open(image_path).convert("L")
         array = np.asarray(image)
         dark = array < 128
+        if dark.mean() > 0.5:  # light ink on a dark background
+            dark = array > 128
         rows = np.where(dark.any(axis=1))[0]
         cols = np.where(dark.any(axis=0))[0]
         if rows.size == 0 or cols.size == 0:
-            return False
+            return None
         y0, y1, x0, x1 = int(rows[0]), int(rows[-1]), int(cols[0]), int(cols[-1])
         height, width = y1 - y0 + 1, x1 - x0 + 1
-        if height < 20 or width < 20:
-            return False
-        left_width = max(2, int(width * 0.12))
+        if height < 24 or width < 24:
+            return None
+        left_width = max(3, int(width * 0.15))
         region = dark[y0 : y1 + 1, x0 : x0 + left_width]
-        column_coverage = region.sum(axis=0)
-        if not bool((column_coverage >= 0.55 * height).any()):
-            return False
-        # A straight vertical stroke (matrix/absolute-value delimiter, table border)
-        # also covers one column. A curly brace's horizontal centroid moves along
-        # its height (hooks at top/bottom, cusp in the middle), so require spread.
-        centroids = []
+        if float(region.any(axis=1).mean()) < 0.85:
+            return None
+        left_edges: list[float] = []
+        run_widths: list[float] = []
         for row in region:
-            columns = np.where(row)[0]
-            if columns.size:
-                centroids.append(float(columns.mean()))
-        if len(centroids) < max(4, int(height * 0.3)):
-            return False
-        spread = max(centroids) - min(centroids)
-        return spread >= max(2.0, width * 0.01)
+            columns = np.flatnonzero(row)
+            if columns.size == 0:
+                left_edges.append(float("nan"))
+                run_widths.append(float("nan"))
+                continue
+            start = int(columns[0])
+            gaps = np.where(np.diff(columns) > 1)[0]
+            end = int(columns[gaps[0]]) if gaps.size else int(columns[-1])
+            left_edges.append(float(start))
+            run_widths.append(float(end - start + 1))
+        if int(np.isfinite(left_edges).sum()) < int(height * 0.8):
+            return None
+        band = max(2, int(height * 0.06))
+        top = slice(0, band)
+        bottom = slice(height - band, height)
+        middle = slice(int(height * 0.40), int(height * 0.60) + 1)
+        mid_left = _finite_median(left_edges[middle])
+        end_left = _finite_median(np.concatenate([left_edges[top], left_edges[bottom]]))
+        cusp = end_left - mid_left
+        mid_width = _finite_median(run_widths[middle])
+        top_width = _finite_max(run_widths[top])
+        bottom_width = _finite_max(run_widths[bottom])
+        left_median = _finite_median(left_edges)
+        if not all(np.isfinite(v) for v in (cusp, mid_width, top_width, bottom_width, left_median)):
+            return None
+        if left_median > left_width * 0.6:  # delimiter must sit at the very left
+            return None
+        if cusp >= max(2.0, height * 0.02):
+            return "brace"
+        if (
+            top_width >= max(mid_width + 2.0, mid_width * 1.5)
+            and bottom_width >= max(mid_width + 2.0, mid_width * 1.5)
+            and mid_width <= max(6.0, height * 0.08)
+        ):
+            return "bracket"
+        return None
     except Exception:
-        return False
+        return None
+
+
+def detect_left_brace(image_path: str) -> bool:
+    """Backward-compatible boolean wrapper around :func:`detect_left_delimiter`."""
+    return detect_left_delimiter(image_path) == "brace"
 
 
 # --------------------------------------------------------------------------
@@ -538,6 +610,7 @@ def run_request(request: dict, *, token: str, model: str) -> dict:
         raw_latex: str
         conf: float | None = None
         brace: bool | None = None
+        delimiter: str | None = None
 
         if mode == "latex":
             raw_latex = _strip_wrappers(str(request.get("latex") or ""))
@@ -555,8 +628,9 @@ def run_request(request: dict, *, token: str, model: str) -> dict:
                 image_path, should_remove = grab_clipboard_image()
                 cleanup_path = image_path if should_remove else None
             raw_latex, conf = recognize(image_path, token, model)
-            brace = detect_left_brace(image_path)
-            latex = normalize_latex(raw_latex, brace_hint=brace)
+            delimiter = detect_left_delimiter(image_path)
+            brace = delimiter is not None
+            latex = normalize_latex(raw_latex, brace_hint=delimiter)
         else:
             raise RunError("未知的 mode：%s" % mode)
 
@@ -579,6 +653,7 @@ def run_request(request: dict, *, token: str, model: str) -> dict:
             "raw_latex": raw_latex,
             "conf": conf,
             "brace": brace,
+            "delimiter": delimiter,
             "width": inserted["width"],
             "height": inserted["height"],
             "elapsedMs": int((time.time() - started) * 1000),
@@ -698,6 +773,11 @@ def selftest() -> int:
         normalize_latex(r"y=\begin{aligned}a&=b\\c&=d\end{aligned}", brace_hint=True)
         == r"y=\left\{\begin{array}{l}a=b \\ c=d\end{array}\right.",
     )
+    check(
+        "normalize adds bracket",
+        normalize_latex(r"\begin{aligned}a&=b\\c&=d\end{aligned}", brace_hint="bracket")
+        == r"\left[\begin{array}{l}a=b \\ c=d\end{array}\right]",
+    )
 
     try:
         from hotkey_runner import parse_hotkey
@@ -723,7 +803,7 @@ def selftest() -> int:
             image = Image.new("L", (200, 200), 255)
             ImageDraw.Draw(image).rectangle([10, 10, 16, 190], fill=0)
             image.save(vertical)
-            check("detect_left_brace rejects straight vertical line", detect_left_brace(str(vertical)) is False)
+            check("delimiter rejects straight vertical line", detect_left_delimiter(str(vertical)) is None)
 
             plain = Path(tmp) / "plain.png"
             image = Image.new("L", (200, 200), 255)
@@ -731,7 +811,7 @@ def selftest() -> int:
             draw.rectangle([40, 60, 60, 80], fill=0)
             draw.rectangle([100, 60, 130, 80], fill=0)
             image.save(plain)
-            check("detect_left_brace skips simple formula", detect_left_brace(str(plain)) is False)
+            check("delimiter skips simple formula", detect_left_delimiter(str(plain)) is None)
 
         try:
             import matplotlib
@@ -739,16 +819,24 @@ def selftest() -> int:
             import matplotlib.pyplot as plt
 
             with tempfile.TemporaryDirectory() as tmp:
-                brace_png = Path(tmp) / "brace.png"
-                fig = plt.figure(figsize=(3, 1.6), dpi=200)
-                fig.text(0.05, 0.5, r"$\left\{\frac{a}{b}=\frac{c}{d}\right.$", fontsize=24, va="center")
-                fig.savefig(brace_png, facecolor="white", bbox_inches="tight", pad_inches=0.1)
-                plt.close(fig)
-                check("detect_left_brace finds a rendered brace", detect_left_brace(str(brace_png)) is True)
+                def render(name: str, tex: str) -> str:
+                    path = Path(tmp) / (name + ".png")
+                    fig = plt.figure(figsize=(3, 1.6), dpi=200)
+                    fig.text(0.05, 0.5, "$" + tex + "$", fontsize=24, va="center")
+                    fig.savefig(path, facecolor="white", bbox_inches="tight", pad_inches=0.1)
+                    plt.close(fig)
+                    return str(path)
+
+                brace_png = render("brace", r"\left\{\frac{a}{b}=\frac{c}{d}\right.")
+                check("delimiter finds a rendered brace", detect_left_delimiter(brace_png) == "brace")
+                bracket_png = render("bracket", r"\left[\frac{a}{b}\right]")
+                check("delimiter finds a rendered bracket", detect_left_delimiter(bracket_png) == "bracket")
+                bars_png = render("bars", r"\left|\frac{a}{b}\right|")
+                check("delimiter ignores absolute-value bars", detect_left_delimiter(bars_png) is None)
         except ImportError:
-            print("SKIP  detect_left_brace positive (matplotlib not installed)")
+            print("SKIP  delimiter positives (matplotlib not installed)")
     except Exception as exc:  # noqa: BLE001
-        check("detect_left_brace environment", False, repr(exc))
+        check("delimiter environment", False, repr(exc))
 
     # Test mode must short-circuit before clipboard/network/insertion.
     os.environ["DSH_FORMULA_TEST_MODE"] = "1"

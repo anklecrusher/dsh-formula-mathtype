@@ -45,6 +45,7 @@ Word 光标处 / PPT 当前幻灯片：可编辑的 MathType 公式
 
 - **多行方程组**：SimpleTex 常把大括号系统识别成 `\begin{aligned}...` 并丢掉大括号。插件会把 `aligned` 归一化成 MathType 支持的 `array`，并根据原图左侧是否存在高瘦的大括号，决定是否加回 `\left\{...\right.`。
 - **MathType 不支持的写法**：`aligned`/`align`/`split`/`gathered` 会被 MathType 渲染成红色错误符号，已在归一化阶段转换；`array`/`matrix`/`cases`/`\left\{...\right.` 经实测可用。
+- **左侧定界符还原**：截图最左侧是 `{` 或 `[` 时，会分别还原成 `\left\{...\right.` / `\left[...\right]`；竖线、绝对值、表格边框等不会被误判（检测逻辑：高度覆盖 + 花括号中部尖点 / 方括号上下短横，见 `helper.py` 的 `detect_left_delimiter`）。
 - **识别模型**：默认 `standard`（0.05 元/次）。`turbo`（0.04 元/次）更快，但实测对多行方程组会出现重复行、括号不平衡，复杂公式不要用。
 - OCR 仍可能有个别下标识别错误（例如把 `\xi_{\psi i}` 认成 `\xi_{yi}`）；插入后可直接在 MathType 里改，不影响对象可用性。
 
@@ -78,11 +79,12 @@ Word 光标处 / PPT 当前幻灯片：可编辑的 MathType 公式
    %LOCALAPPDATA%\dsh-formula-mathtype\simpletex.token
    ```
 
-3. 按本机解释器/令牌路径改 `cordis.patch.yml` 里的 `pythonPath`、`tokenFile`（可选 `model: standard|turbo`）。
+3. `cordis.patch.yml` 里的 `pythonPath`、`tokenFile` 默认留空即可：Python 会自动探测，令牌默认读 `%LOCALAPPDATA%\dsh-formula-mathtype\simpletex.token`；只有自动探测失败时才需要填绝对路径（可选 `model: standard|turbo`）。
 4. 加入 desktop profile（desktop profile 只能由桌面端自带 CLI 管理）：
 
    ```powershell
-   & "D:\Users\ankle crusher\AppData\Local\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" `
+   # <DSH 安装目录> 例如 D:\Users\ankle crusher\AppData\Local\Programs\DeepSeek Harness
+   & "<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd" `
        plugin --profile desktop add "@local/dsh-formula-mathtype@link:E:/GitHubWorkspace/own/opensource/dsh-formula-mathtype"
    ```
 
@@ -90,8 +92,8 @@ Word 光标处 / PPT 当前幻灯片：可编辑的 MathType 公式
    >
    > 若 pnpm 11 报 `ERR_PNPM_IGNORED_BUILDS`（本机是 `protobufjs`），先在 profile 目录批准一次构建：
    > ```powershell
-   > & "D:\Users\ankle crusher\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe" --expose-internals `
-   >   "D:\Users\ankle crusher\AppData\Local\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.mjs" `
+   > & "<DSH 安装目录>\DeepSeek Harness.exe" --expose-internals `
+   >   "<DSH 安装目录>\resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.mjs" `
    >   approve-builds protobufjs
    > ```
    > 它会在 `profile/pnpm-workspace.yaml` 里写入 `allowBuilds: { protobufjs: true }`；不修的话之后任何插件安装都会被这个严格构建检查挡住。
@@ -124,7 +126,7 @@ PowerPoint 的插入位置：当前幻灯片居中；如果先选中了一个形
 
 副作用：插件运行期间，Word 的 `Ctrl+Alt+F` 插入脚注快捷键会被本插件占用；需要插脚注时用「引用 → 插入脚注」功能区按钮。热键对所有前台程序都生效（不只 Word/PPT），换取的是不切窗口就能插入。
 
-排查信息：`hotkey.log` 会记录每次插入的 LaTeX 片段（最多 300 字符）与错误原因，方便定位；如果公式内容敏感，可定期清空该文件。
+排查信息：`hotkey.log` 只记录时间、目标程序、公式长度、置信度和错误原因，**不记录公式内容**（可以放心贴出来排查）。
 
 启用/关闭/查看状态：
 
@@ -191,6 +193,23 @@ PowerPoint 的插入位置：当前幻灯片居中；如果先选中了一个形
 - PPT 里插入的是**浮动 OLE 对象**，不能像 Word 那样内联进文字段落；位置默认居中，可拖动调整。
 - 多行方程组识别约 10 秒（标准模型网络耗时）。
 - A 版（`/formula` 命令）与 B 版（全局热键）都已可用；B 版会常驻一个 Python 热键进程（约 30–40 MB 内存），配置 `hotkey: ''` 可关闭。
+
+## 换电脑 / 新环境
+
+1. 安装依赖：Windows + MathType 7（提供 `Equation.DSMT4` OLE 服务器）+ 桌面版 Word / PowerPoint + Python 3.10+（`requests`、`Pillow`、`numpy`）。`.NET Framework` 的 `csc.exe` Windows 自带。
+2. 克隆仓库：`git clone https://github.com/anklecrusher/dsh-formula-mathtype.git`
+3. 写令牌（一行 UAT）：`%LOCALAPPDATA%\dsh-formula-mathtype\simpletex.token`
+4. 安装到 desktop profile（desktop profile 只能由桌面端自带 CLI 管理）：
+
+   ```powershell
+   & "<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd" `
+       plugin --profile desktop add "@local/dsh-formula-mathtype@link:<克隆目录的绝对路径>"
+   ```
+
+   然后把 `"@local/dsh-formula-mathtype"` 加进 profile `package.json` 的 `dsh.profile.bundles`（和本机一样，放在 `@local/dsh-latex-tool` 后面即可）。
+5. 重启 DSH。首次插入公式时 `helper.py` 会自动用 `csc.exe` 编译注入器；`/formula hotkey status` 应显示「热键助手运行中」。
+
+`cordis.patch.yml` 里的 `pythonPath` / `tokenFile` 默认留空：Python 会自动探测（环境变量 `DSH_FORMULA_PYTHON` / `PYTHON`、常见安装目录），令牌默认读 `%LOCALAPPDATA%\dsh-formula-mathtype\simpletex.token`。只有自动探测失败时才需要在这里填绝对路径。
 
 ## 路线图
 
