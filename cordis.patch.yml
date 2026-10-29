@@ -19,5 +19,5 @@
         # standard = 标准模型（0.05 元/次，复杂多行方程组明显更准）；turbo = 轻量模型（0.04 元/次）
         model: standard
         # B 模式：全局热键。截图后不用切回 DSH，直接按这个键就把公式插进 Word。
-        # 写成空字符串 '' 可关闭热键常驻进程；被其它软件占用时换一个（如 Ctrl+Alt+M）。
-        hotkey: 'Ctrl+Alt+F'
+        # 写成空字符串 '' 可关闭热键常驻进程；被其它软件占用时换一个（如 Alt+Shift+F）。
+        hotkey: 'Alt+M'

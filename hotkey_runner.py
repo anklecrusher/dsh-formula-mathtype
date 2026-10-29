@@ -3,7 +3,7 @@
 """Global-hotkey companion for @local/dsh-formula-mathtype (the "B" mode).
 
 The DSH plugin starts this as a small resident process. Pressing the configured
-hotkey (default Ctrl+Alt+F) anywhere on the desktop:
+hotkey (default Alt+M) anywhere on the desktop:
 
 1. reads the formula screenshot from the clipboard,
 2. runs the same SimpleTex OCR + normalization + MathType OLE injection as the
@@ -12,11 +12,17 @@ hotkey (default Ctrl+Alt+F) anywhere on the desktop:
    the result. The toast is a layered WS_EX_NOACTIVATE window, so Word keeps the
    focus; no Tk/Tcl is involved (the local Python's Tcl package is incomplete).
 
+The combo is captured with a low-level keyboard hook (`WH_KEYBOARD_LL`) rather
+than `RegisterHotKey`, so the key never reaches Word. This matters for a combo
+like Alt+M: Word treats Alt+M as its Mailings-tab shortcut. The hook swallows
+the main key; Alt may still put Word into keytip mode briefly, which is cleared
+with an automatic Esc about 0.3 s later when Word owns the foreground window.
+
 Diagnostics are written to ``%LOCALAPPDATA%\\dsh-formula-mathtype\\hotkey.log``.
 
 Standalone use (for testing)::
 
-    python helper.py hotkey --hotkey Ctrl+Alt+F
+    python helper.py hotkey --hotkey Alt+M
 """
 
 from __future__ import annotations
@@ -37,6 +43,13 @@ WM_TIMER = 0x0113
 WM_ERASEBKGND = 0x0014
 WM_APP_UPDATE = 0x8001
 WM_APP_EXIT = 0x8002
+WM_APP_TRIGGER = 0x8003
+WH_KEYBOARD_LL = 13
+HC_ACTION = 0
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -98,7 +111,18 @@ class PAINTSTRUCT(ctypes.Structure):
     ]
 
 
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
@@ -154,6 +178,20 @@ _user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.UnregisterHotKey.restype = wintypes.BOOL
 _user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 _user32.PostThreadMessageW.restype = wintypes.BOOL
+_user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+_user32.SetWindowsHookExW.restype = wintypes.HANDLE
+_user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+_user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+_user32.CallNextHookEx.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+_user32.CallNextHookEx.restype = ctypes.c_ssize_t
+_user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+_user32.GetAsyncKeyState.restype = ctypes.c_short
+_user32.GetForegroundWindow.argtypes = []
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+_user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t]
+_user32.keybd_event.restype = None
 _user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 _user32.GetSystemMetrics.restype = ctypes.c_int
 _user32.SetProcessDPIAware.argtypes = []
@@ -193,6 +231,12 @@ _kernel32.GetCurrentThreadId.argtypes = []
 _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 _kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
 _kernel32.CreateMutexW.restype = wintypes.HANDLE
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
 
 
 def _rgb(red: int, green: int, blue: int) -> int:
@@ -216,8 +260,31 @@ def _append_log(line: str) -> None:
         pass
 
 
+def _foreground_process_name() -> str:
+    """Basename (lowercase) of the process owning the foreground window."""
+    try:
+        hwnd = _user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        pid = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        handle = _kernel32.OpenProcess(0x1000, False, int(pid.value))
+        if not handle:
+            return ""
+        try:
+            buffer = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if not _kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return ""
+            return buffer.value.rsplit("\\", 1)[-1].lower()
+        finally:
+            _kernel32.CloseHandle(handle)
+    except Exception:
+        return ""
+
+
 def parse_hotkey(spec: str) -> tuple[int, int]:
-    """Turn "Ctrl+Alt+F" into (MOD_*, virtual-key code)."""
+    """Turn "Alt+M" into (MOD_*, virtual-key code)."""
     text = (spec or "").strip()
     if not text:
         raise ValueError("热键为空")
@@ -240,7 +307,7 @@ def parse_hotkey(spec: str) -> tuple[int, int]:
         else:
             raise ValueError("无法解析热键片段：%s" % part)
     if key is None:
-        raise ValueError("热键需要包含一个主键，例如 Ctrl+Alt+F")
+        raise ValueError("热键需要包含一个主键，例如 Alt+M")
     if modifiers == 0:
         raise ValueError("热键至少需要一个修饰键（Ctrl/Alt/Shift/Win）")
     return modifiers | MOD_NOREPEAT, key
@@ -398,6 +465,12 @@ class HotkeyApp:
         self.thread_id = 0
         self.toast: ToastWindow | None = None
         self.exit_code = 0
+        self.modifiers = 0
+        self.vk = 0
+        self.hook = None
+        self._hook_proc_ref = None
+        self._latched = False
+        self._needs_esc = False
 
     def _post_update(self) -> None:
         try:
@@ -436,21 +509,30 @@ class HotkeyApp:
             modifiers, vk = parse_hotkey(self.hotkey)
         except ValueError as exc:
             return self._fatal(str(exc))
-        if not _user32.RegisterHotKey(None, HOTKEY_ID, modifiers, vk):
+        self.modifiers = modifiers & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN)
+        self.vk = vk
+        self._needs_esc = bool(self.modifiers & (MOD_ALT | MOD_WIN))
+        self._hook_proc_ref = HOOKPROC(self._hook_proc)
+        self.hook = _user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._hook_proc_ref, _kernel32.GetModuleHandleW(None), 0
+        )
+        if not self.hook:
             return self._fatal(
-                "注册全局热键 %s 失败（可能被其它程序占用）。"
-                "可在 cordis.patch.yml 的插件配置里换一个 hotkey，例如 Ctrl+Alt+M。" % self.hotkey
+                "安装全局键盘钩子失败（热键 %s 无法注册）。"
+                "可在 cordis.patch.yml 的插件配置里换一个 hotkey，例如 Alt+Shift+F。" % self.hotkey
             )
-        _append_log("hotkey registered: %s" % self.hotkey)
+        _append_log("hotkey registered: %s (low-level hook)" % self.hotkey)
         if self.toast is not None:
             self.toast.show("公式热键已就绪：%s" % self.hotkey, ttl_ms=1800)
         try:
             return self._message_loop()
         finally:
-            try:
-                _user32.UnregisterHotKey(None, HOTKEY_ID)
-            except Exception:
-                pass
+            if self.hook:
+                try:
+                    _user32.UnhookWindowsHookEx(self.hook)
+                except Exception:
+                    pass
+                self.hook = None
             if self.toast is not None:
                 self.toast.destroy()
 
@@ -477,12 +559,79 @@ class HotkeyApp:
                     self._drain_events()
                 elif message.message == WM_APP_EXIT:
                     break
-                elif message.message == WM_HOTKEY and int(message.wParam) == HOTKEY_ID:
+                elif message.message == WM_APP_TRIGGER:
                     self._on_press()
                 continue
             _user32.TranslateMessage(ctypes.byref(message))
             _user32.DispatchMessageW(ctypes.byref(message))
         return self.exit_code
+
+    # -- low-level keyboard hook -------------------------------------------
+
+    def _post_trigger(self) -> None:
+        try:
+            _user32.PostThreadMessageW(self.thread_id, WM_APP_TRIGGER, 0, 0)
+        except Exception:
+            pass
+
+    def _modifiers_match(self) -> bool:
+        def down(vk: int) -> bool:
+            return bool(_user32.GetAsyncKeyState(vk) & 0x8000)
+
+        ctrl = down(0x11)  # VK_CONTROL
+        alt = down(0x12)  # VK_MENU
+        shift = down(0x10)  # VK_SHIFT
+        win = down(0x5B) or down(0x5C)  # VK_LWIN / VK_RWIN
+        return (
+            ctrl == bool(self.modifiers & MOD_CONTROL)
+            and alt == bool(self.modifiers & MOD_ALT)
+            and shift == bool(self.modifiers & MOD_SHIFT)
+            and win == bool(self.modifiers & MOD_WIN)
+        )
+
+    def _hook_proc(self, n_code, w_param, l_param):
+        """Swallow the configured combo so Word/other apps never see it."""
+        try:
+            if n_code == HC_ACTION:
+                keyboard = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                vk = int(keyboard.vkCode)
+                message = int(w_param)
+                if message in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    if vk == self.vk and self._modifiers_match():
+                        if not self._latched:
+                            self._latched = True
+                            self._post_trigger()
+                        return 1  # swallow the key-down (and auto-repeats)
+                elif message in (WM_KEYUP, WM_SYSKEYUP):
+                    if vk == self.vk and self._latched:
+                        self._latched = False
+                        return 1  # swallow the matching key-up
+        except Exception:
+            pass
+        return _user32.CallNextHookEx(self.hook or 0, n_code, w_param, l_param)
+
+    def _dismiss_word_keytips(self) -> None:
+        """Alt-based combos put Word into keytip mode; Esc clears it."""
+        if not self._needs_esc:
+            return
+        if _foreground_process_name() != "winword.exe":
+            return
+        try:
+            _user32.keybd_event(0x1B, 0, 0, 0)  # VK_ESCAPE down
+            _user32.keybd_event(0x1B, 0, 2, 0)  # up
+            _append_log("cleared Word keytip mode")
+        except Exception:
+            pass
+
+    def _schedule_menu_dismiss(self) -> None:
+        if not self._needs_esc:
+            return
+
+        def _fire() -> None:
+            time.sleep(0.3)
+            self._dismiss_word_keytips()
+
+        threading.Thread(target=_fire, daemon=True, name="hotkey-keytips").start()
 
     # -- events ------------------------------------------------------------
 
@@ -494,6 +643,7 @@ class HotkeyApp:
             return
         self.busy = True
         _append_log("hotkey pressed")
+        self._schedule_menu_dismiss()
         if self.toast is not None:
             self.toast.show("正在识别公式…", ttl_ms=0)
         threading.Thread(target=self._work, daemon=True, name="hotkey-worker").start()
