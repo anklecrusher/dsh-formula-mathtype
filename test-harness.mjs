@@ -2,10 +2,10 @@
  * Standalone harness: exercise the plugin without the DSH runtime.
  *
  * Mocks ctx.tools.register / ctx.commands.register / ctx.effect, verifies what
- * was registered, checks argument validation, and then drives one real sidecar
- * request through the command handler (expected to fail cleanly here because no
- * Word document is open in the harness environment — the point is that the
- * JSON-lines round trip and the error path work, not the insertion itself).
+ * was registered, checks argument validation, drives one real sidecar request
+ * through the command handler (expected to fail cleanly here because no Word
+ * document is open in the harness environment), and finally checks the
+ * `/formula hotkey status` subcommand of the B-mode companion.
  *
  * Run with: node test-harness.mjs
  */
@@ -79,8 +79,21 @@ if (commandResult?.kind === 'error') {
   console.log('  sidecar error text :', String(commandResult.text).split('\n')[0])
 }
 
+// B mode: the hotkey companion starts after the sidecar warm-up. Give it a
+// moment, then verify the status subcommand wired into /formula.
+await new Promise((resolve) => setTimeout(resolve, 2500))
+const hotkeyStatus = await registeredCommand.handler({ rawInput: 'hotkey status' })
+check(
+  'hotkey status command',
+  hotkeyStatus?.kind === 'success' && typeof hotkeyStatus.text === 'string' && hotkeyStatus.text.includes('热键'),
+  JSON.stringify(hotkeyStatus),
+)
+console.log('  hotkey status text :', String(hotkeyStatus?.text ?? '').split('\n').join(' / '))
+const hotkeyOff = await registeredCommand.handler({ rawInput: 'hotkey off' })
+check('hotkey off command', hotkeyOff?.kind === 'success', JSON.stringify(hotkeyOff))
+
 if (typeof dispose === 'function') dispose()
-await new Promise((resolve) => setTimeout(resolve, 300))
+await new Promise((resolve) => setTimeout(resolve, 500))
 
 console.log('---')
 if (failures > 0) {

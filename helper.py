@@ -544,9 +544,33 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--token-file", default="")
     run_parser.add_argument("--model", default="standard", choices=["turbo", "standard"])
 
+    hotkey_parser = sub.add_parser("hotkey", help="run the global-hotkey companion (B mode)")
+    hotkey_parser.add_argument("--hotkey", default="Ctrl+Alt+F")
+    hotkey_parser.add_argument("--token-file", default="")
+    hotkey_parser.add_argument("--model", default="standard", choices=["turbo", "standard"])
+
     args = parser.parse_args(argv)
     if args.command == "serve":
         return serve(token_file=args.token_file, model=args.model)
+
+    if args.command == "hotkey":
+        token = ""
+        try:
+            token = read_token(args.token_file)
+        except Exception as exc:
+            log("token unavailable:", exc)
+        try:
+            ensure_injector()
+        except Exception as exc:
+            log("injector build failed:", exc)
+        from hotkey_runner import run_hotkey_app
+
+        return run_hotkey_app(
+            hotkey=args.hotkey,
+            token=token,
+            token_file=args.token_file,
+            model=args.model,
+        )
 
     request: dict = {"action": "run", "mode": args.mode}
     if args.latex:

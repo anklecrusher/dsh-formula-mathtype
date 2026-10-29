@@ -23,11 +23,20 @@
  *   - command `/formula`  — deterministic, no model round-trip:
  *       `/formula`              insert the clipboard screenshot
  *       `/formula \frac{a}{b}`  insert the given LaTeX directly
+ *       `/formula hotkey ...`   manage the global-hotkey companion (B mode)
  *   - tool `formula_insert` — same flow, callable by the model when the user
  *       asks in natural language.
  *
- * The sidecar is started lazily, kept warm across requests (MathType's engine
- * and Word COM startup are paid once), and disposed with the plugin.
+ * Two side processes are managed:
+ *   - the Python sidecar (`helper.py serve`), always on, driven over JSON lines;
+ *   - the global-hotkey companion (`helper.py hotkey`), started after the
+ *       sidecar warmed up. It registers a system-wide hotkey (default
+ *       Ctrl+Alt+F), so pressing it while Word is focused inserts the clipboard
+ *       screenshot without switching back to DSH. Set `hotkey: ''` in the plugin
+ *       config to disable it.
+ *
+ * The sidecar is started lazily, kept warm across requests, and disposed with
+ * the plugin.
  *
  * @module @local/dsh-formula-mathtype
  */
@@ -100,6 +109,9 @@ const REQUEST_TIMEOUT_MS = 180_000
 
 /** Timeout for the non-blocking MathType engine warm-up at plugin load. */
 const WARMUP_TIMEOUT_MS = 60_000
+
+/** Default system-wide hotkey for the B-mode companion. */
+const DEFAULT_HOTKEY = 'Ctrl+Alt+F'
 
 /**
  * Persistent JSON-lines client for helper.py.
@@ -302,6 +314,152 @@ class PythonSidecar {
 }
 
 /**
+ * Resident global-hotkey companion (`helper.py hotkey`, the B mode).
+ *
+ * It is a separate Python process on purpose: it owns a Win32 hotkey message
+ * loop and a small Tk toast, so it must not share stdin/stdout with the JSON
+ * sidecar. Feedback goes to a toast and to
+ * `%LOCALAPPDATA%\dsh-formula-mathtype\hotkey.log`.
+ */
+class HotkeyCompanion {
+  /** @param {{pythonPath: string, helperPath: string, tokenFile: string, model: string, hotkey: string}} options */
+  constructor(options) {
+    this.options = options
+    this.child = null
+    this.stderrTail = ''
+    this.lastError = ''
+    // Take the companion down with the host process if the app exits or crashes.
+    this.exitHook = () => this.stop()
+    process.once('exit', this.exitHook)
+  }
+
+  /** True when the companion process is alive. */
+  get running() {
+    return this.child !== null && this.child.exitCode === null
+  }
+
+  /** Start the companion; returns false when no hotkey is configured. */
+  start() {
+    if (typeof this.options.hotkey !== 'string' || this.options.hotkey.length === 0) {
+      this.lastError = '未配置 hotkey（配置项 hotkey 为空）'
+      return false
+    }
+    if (this.running) return true
+
+    const args = [
+      this.options.helperPath,
+      'hotkey',
+      '--hotkey',
+      this.options.hotkey,
+      '--token-file',
+      this.options.tokenFile,
+      '--model',
+      this.options.model,
+    ]
+    const child = spawn(this.options.pythonPath, args, {
+      cwd: dirname(this.options.helperPath),
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: 'utf-8',
+        PYTHONUTF8: '1',
+      },
+    })
+    this.child = child
+    this.stderrTail = ''
+    this.lastError = ''
+
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (chunk) => {
+      this.stderrTail = (this.stderrTail + chunk).slice(-4000)
+    })
+    child.on('error', (error) => {
+      this.child = null
+      this.lastError = `热键助手启动失败：${error.message}`
+    })
+    child.on('exit', (code, signal) => {
+      if (this.child === child) this.child = null
+      if (code !== 0 && code !== null) {
+        const tail = this.stderrTail.trim().split('\n').slice(-3).join(' ')
+        this.lastError = `热键助手退出 (code=${code}, signal=${signal})：${tail || '见 hotkey.log'}`
+      }
+    })
+    return true
+  }
+
+  /** Stop the companion process. */
+  stop() {
+    const child = this.child
+    this.child = null
+    if (child === null) return
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /** Snapshot for the `/formula hotkey status` command. */
+  status() {
+    return {
+      running: this.running,
+      hotkey: this.options.hotkey,
+      pid: this.child !== null ? this.child.pid : null,
+      lastError: this.lastError,
+    }
+  }
+}
+
+/**
+ * Handle `/formula hotkey ...` (status / on / off / restart).
+ * @param {HotkeyCompanion} companion
+ * @param {string} sub - the text after "hotkey"
+ */
+async function handleHotkeyCommand(companion, sub) {
+  const action = sub.trim().toLowerCase() || 'status'
+  if (action === 'status') {
+    const status = companion.status()
+    const lines = [
+      status.running ? `热键助手运行中（pid ${status.pid}）` : '热键助手未运行',
+      `热键：${status.hotkey || '未配置'}`,
+    ]
+    if (status.lastError) lines.push(`最近错误：${status.lastError}`)
+    return { kind: 'success', text: lines.join('\n') }
+  }
+  if (action === 'on' || action === 'start') {
+    if (companion.options.hotkey && companion.options.hotkey.length === 0) {
+      return { kind: 'error', text: '未配置 hotkey：请在 cordis.patch.yml 的插件配置里填写 hotkey（如 Ctrl+Alt+F）。' }
+    }
+    companion.start()
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    const status = companion.status()
+    if (status.running) {
+      return { kind: 'success', text: `热键助手已启动（pid ${status.pid}，热键 ${status.hotkey}）。` }
+    }
+    return { kind: 'error', text: `热键助手启动失败：${status.lastError || '见 %LOCALAPPDATA%\\dsh-formula-mathtype\\hotkey.log'}` }
+  }
+  if (action === 'off' || action === 'stop') {
+    companion.stop()
+    return { kind: 'success', text: '热键助手已停止。' }
+  }
+  if (action === 'restart') {
+    companion.stop()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    companion.start()
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    const status = companion.status()
+    return status.running
+      ? { kind: 'success', text: `热键助手已重启（pid ${status.pid}，热键 ${status.hotkey}）。` }
+      : { kind: 'error', text: `热键助手重启失败：${status.lastError || '见 hotkey.log'}` }
+  }
+  return {
+    kind: 'error',
+    text: '用法：/formula hotkey [status|on|off|restart]',
+  }
+}
+
+/**
  * Pick the effective mode for a call.
  * @param {Record<string, any>} args
  * @returns {'clipboard'|'latex'|'image'}
@@ -423,15 +581,21 @@ function createTool(sidecar) {
  * Build the `/formula` command definition (deterministic, no model round-trip).
  * @param {PythonSidecar} sidecar
  */
-function createCommand(sidecar) {
+function createCommand(sidecar, hotkey) {
   return {
     name: 'formula',
-    description: '识别剪贴板里的公式截图并以 MathType 公式插入当前 Word 文档；也可 /formula <LaTeX> 直接插入',
+    description:
+      '识别剪贴板公式截图并以 MathType 公式插入当前 Word 文档；'
+      + '/formula <LaTeX> 直接插入；/formula hotkey [status|on|off|restart] 管理全局热键',
     input: {
-      hint: '[可选的 LaTeX 文本；省略则读取剪贴板截图]',
+      hint: '[可选的 LaTeX 文本 | hotkey [status|on|off|restart]；省略则读取剪贴板截图]',
     },
     async handler(invocation) {
       const raw = String(invocation?.rawInput ?? '').trim()
+      const hotkeyMatch = /^hotkey(?:\s+(.*))?$/i.exec(raw)
+      if (hotkeyMatch !== null) {
+        return handleHotkeyCommand(hotkey, hotkeyMatch[1] ?? '')
+      }
       const mode = raw.length > 0 ? 'latex' : 'clipboard'
       try {
         const result = await sidecar.request({
@@ -465,28 +629,39 @@ function resolveOptions(config) {
       ? config.tokenFile.trim()
       : DEFAULT_TOKEN_FILE
   const model = config?.model === 'turbo' ? 'turbo' : 'standard'
-  return { pythonPath, helperPath, tokenFile, model }
+  const hotkey = typeof config?.hotkey === 'string' ? config.hotkey.trim() : DEFAULT_HOTKEY
+  return { pythonPath, helperPath, tokenFile, model, hotkey }
 }
 
 /**
  * Plugin entry point.
  * @param ctx - plugin context; requires `tools` and `commands`.
- * @param config - plugin config: pythonPath, helperPath, tokenFile, model.
+ * @param config - plugin config: pythonPath, helperPath, tokenFile, model, hotkey.
  */
 export function apply(ctx, config) {
   const options = resolveOptions(config)
   const sidecar = new PythonSidecar(options)
+  const hotkey = new HotkeyCompanion(options)
 
   if (typeof ctx.effect === 'function') {
-    ctx.effect(() => () => sidecar.dispose(), 'dsh-formula-mathtype: python sidecar')
+    ctx.effect(
+      () => () => {
+        hotkey.stop()
+        sidecar.dispose()
+      },
+      'dsh-formula-mathtype: sidecar + hotkey companion',
+    )
   }
 
   ctx.tools.register(createTool(sidecar))
-  ctx.commands.register(createCommand(sidecar))
+  ctx.commands.register(createCommand(sidecar, hotkey))
 
-  // Warm the sidecar (Python + build the C# injector) without blocking activation.
-  // Word is intentionally not touched: it only exists when the user has it open.
-  sidecar.request({ action: 'warmup' }, WARMUP_TIMEOUT_MS).catch(() => {})
+  // Warm the sidecar first (it builds the injector), then start the hotkey
+  // companion so the two processes never compile the injector at the same time.
+  sidecar.request({ action: 'warmup' }, WARMUP_TIMEOUT_MS).then(
+    () => hotkey.start(),
+    () => hotkey.start(),
+  )
 }
 
 /** Package identity, for diagnostics. */

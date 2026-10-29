@@ -34,6 +34,7 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 | --- | --- |
 | 单行简单公式（截图→OCR→插入） | 约 2.5 秒 |
 | 6 行大括号方程组（standard 模型） | OCR 约 10 秒 + 插入约 2.7 秒 |
+| B 模式按热键到插入（简单公式） | 约 1.2–2.5 秒 |
 
 耗时主要在 SimpleTex 标准模型的网络识别上；插入本身（OLE 对象创建 + TeX 解析 + 保存）对简单公式约 0.4–0.7 秒、对 6 行方程组约 2.7 秒。
 
@@ -52,6 +53,7 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 | `index.js` | DSH 宿主插件：注册 `/formula` 命令与 `formula_insert` 工具，管理常驻 Python sidecar |
 | `helper.py` | Python sidecar：剪贴板取图 / SimpleTex OCR / LaTeX 归一化 / 大括号检测 / 调注入器 |
 | `injector/MathTypeInjector.cs` | Word COM + MathType OLE 注入器源码（首次使用自动编译） |
+| `hotkey_runner.py` | B 模式常驻助手：全局热键 + 原生 Win32 toast + 复用插入逻辑 |
 | `cordis.patch.yml` | 插件行与默认配置 |
 | `test-harness.mjs` | 不依赖 DSH 的离线自测 |
 
@@ -62,6 +64,7 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 - Microsoft Word 桌面版
 - .NET Framework 4.x（Windows 自带 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`，用于首次构建注入器）
 - Python 3.10+，装有 `requests`、`Pillow`、`numpy`（`pywin32` 只在失败回退时用于把 LaTeX 复制到剪贴板，可选）
+- B 模式的热键提示用原生 Win32 分层窗口绘制，**不需要 Tcl/Tk**（本机 Python 的 Tcl 数据不完整，Tkinter 不可用也能工作）
 
 ## 安装
 
@@ -100,6 +103,28 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 
 建议流程：先在 Word 里把光标放到目标段落，再回 DSH 触发；识别结果、置信度和耗时会在会话里显示。多行方程组会自动还原大括号。
 
+## B 模式：全局热键（v0.3.0）
+
+插件加载后会常驻一个热键小助手（`helper.py hotkey`），注册系统级热键（默认 `Ctrl+Alt+F`）。使用流程：
+
+1. `Win+Shift+S` 截公式（图进剪贴板）；
+2. **保持在 Word 里**，直接按 `Ctrl+Alt+F`；
+3. 右上角弹出小提示「正在识别公式…」，完成后变成「✓ 已插入 MathType 公式」并显示 LaTeX 预览，2.6 秒后自动消失；
+4. 失败时显示红色错误提示（8 秒），详情写入 `%LOCALAPPDATA%\dsh-formula-mathtype\hotkey.log`。
+
+实测：简单公式从按键到插入约 **1.2–2.5 秒**，6 行方程组约 10 秒（主要是标准模型识别时间）。提示窗口是无激活（`WS_EX_NOACTIVATE`）的原生 Win32 分层窗口，不会抢 Word 焦点；本机 Python 的 Tcl/Tk 数据不完整，所以没有用 Tkinter。
+
+启用/关闭/查看状态：
+
+```
+/formula hotkey            # 查看运行状态、热键、最近错误
+/formula hotkey on         # 启动热键助手
+/formula hotkey off        # 停止热键助手
+/formula hotkey restart    # 重启（改配置后可用）
+```
+
+配置 `hotkey: ''` 可以完全不启动热键助手；热键被其它软件占用时换一个（如 `Ctrl+Alt+M`）。
+
 ## 配置项
 
 | 键 | 默认 | 说明 |
@@ -108,6 +133,7 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 | `helperPath` | 同目录 `helper.py` | sidecar 路径 |
 | `tokenFile` | `%LOCALAPPDATA%\dsh-formula-mathtype\simpletex.token` | 一行一个 UAT |
 | `model` | `standard` | `standard`=标准模型（0.05 元/次，复杂公式明显更准），`turbo`=轻量模型（0.04 元/次，复杂方程组不稳） |
+| `hotkey` | `Ctrl+Alt+F` | B 模式全局热键；写成空字符串 `''` 关闭热键常驻 |
 
 ## 为什么走这条链路
 
@@ -135,6 +161,9 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 | `构建 MathType 注入器失败` | 确认 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` 存在；删除 `injector/MathTypeInjector.exe` 后重试 |
 | `SimpleTex 识别失败` | 检查令牌、余额、QPS；整页文档图会返回 `[DOCIMG]`，请只截公式区域 |
 | 公式渲染出红色错误符号 | 说明还有 MathType TeX 不支持的写法：把该 LaTeX 发给我，加入归一化规则 |
+| `/formula hotkey` 显示未运行 | 看状态里的最近错误；常见是热键被占用，换一个 `hotkey` 后重启 DSH |
+| 提示“另一个热键助手已在运行” | 上次 DSH 异常退出留下的进程：任务管理器结束对应 `python.exe`（命令行含 `helper.py hotkey`）后 `/formula hotkey restart` |
+| 按热键没反应 | 先在 Word 里确认光标位置；再 `/formula hotkey status` 看助手是否在运行；详细过程见 `hotkey.log` |
 
 ## 限制
 
@@ -142,10 +171,9 @@ injector/MathTypeInjector.exe（Word COM + MathType OLE）
 - 公式插在**光标处**，是行内对象；独立公式的居中、编号请沿用你现有的 Word/MathType 排版习惯。
 - 依赖桌面 Word（Word 未打开时无法插入；不会替你新建文档）。
 - 多行方程组识别约 10 秒（标准模型网络耗时）。
-- 当前是 A 版（DSH 命令触发）；B 版（全局热键常驻）在路线图中。
+- A 版（`/formula` 命令）与 B 版（全局热键）都已可用；B 版会常驻一个 Python 热键进程（约 30–40 MB 内存），配置 `hotkey: ''` 可关闭。
 
 ## 路线图
 
-- **B**：全局热键（如 `Ctrl+Alt+F`）触发，不切窗口直接插入 Word。
 - 公式居中/编号快捷处理（按现有 Word 样式）。
 - 可选：MinerU 本地开源版做整篇 PDF 批量导入（不属于即时截图链路）。
